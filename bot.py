@@ -23,8 +23,8 @@ from telegram.error import Conflict
 # ═══════════════════════════════════════════════════════════════════════
 # ⚙️ الإعدادات
 # ═══════════════════════════════════════════════════════════════════════
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()
-WEBAPP_URL     = os.getenv("WEBAPP_URL", "https://xeonbots.onrender.com/").rstrip("/") + "/"
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "8518711864:AAFpU5zbzrA4Lr5Y6F7qsx1xLxao8xeonbots").strip()
+WEBAPP_URL     = os.getenv("WEBAPP_URL", "https://xenbots.onrender.com/").rstrip("/") + "/"
 BOT_USERNAME   = os.getenv("BOT_USERNAME", "pay_pIus_bot").lstrip("@")
 ADMIN_CONTACT  = os.getenv("ADMIN_CONTACT", "no_vi1").lstrip("@")
 UPLOAD_CHAT_ID = os.getenv("UPLOAD_CHAT_ID", "8233835640")
