@@ -25,9 +25,9 @@ from telegram.error import Conflict
 # ═══════════════════════════════════════════════════════════════════════
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "8518711864:AAFpU5zbzrA4Lr5Y6F7qsx1xLxao8xeonbots").strip()
 WEBAPP_URL     = os.getenv("WEBAPP_URL", "https://xenbots.onrender.com/").rstrip("/") + "/"
-BOT_USERNAME   = os.getenv("BOT_USERNAME", "pay_pIus_bot").lstrip("@")
+BOT_USERNAME   = os.getenv("BOT_USERNAME", "TarzanV1bot").lstrip("@")
 ADMIN_CONTACT  = os.getenv("ADMIN_CONTACT", "no_vi1").lstrip("@")
-UPLOAD_CHAT_ID = os.getenv("UPLOAD_CHAT_ID", "8233835640")
+UPLOAD_CHAT_ID = os.getenv("UPLOAD_CHAT_ID", "8292927197")
 HOST           = os.getenv("HOST", "0.0.0.0")
 PORT           = int(os.getenv("PORT", "8000"))
 DB_PATH        = os.getenv("DB_PATH", "ads.db")
