@@ -1,4 +1,4 @@
-import os, hmac, json, time, sqlite3, hashlib, asyncio, shutil, tempfile
+import os, hmac, json, time, sqlite3, hashlib, asyncio, shutil, tempfile, math
 from urllib.parse import parse_qsl
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
@@ -23,7 +23,7 @@ from telegram.error import Conflict
 # ═══════════════════════════════════════════════════════════════════════
 # ⚙️ الإعدادات
 # ═══════════════════════════════════════════════════════════════════════
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "8909959176:AAHtOv4alGndeFTY0_Juqf5hpLsQV5z-hlc")
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()
 WEBAPP_URL     = os.getenv("WEBAPP_URL", "https://xeonbots.onrender.com/").rstrip("/") + "/"
 BOT_USERNAME   = os.getenv("BOT_USERNAME", "pay_pIus_bot").lstrip("@")
 ADMIN_CONTACT  = os.getenv("ADMIN_CONTACT", "no_vi1").lstrip("@")
@@ -32,6 +32,7 @@ HOST           = os.getenv("HOST", "0.0.0.0")
 PORT           = int(os.getenv("PORT", "8000"))
 DB_PATH        = os.getenv("DB_PATH", "ads.db")
 PING_INTERVAL  = int(os.getenv("PING_INTERVAL", "10"))
+MAX_INIT_DATA_AGE = int(os.getenv("MAX_INIT_DATA_AGE", "86400"))
 
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8233835640").split(",")
              if x.strip().isdigit()]
@@ -272,6 +273,10 @@ def init_db():
             user_id INTEGER, ad_id INTEGER, watched_at TEXT,
             PRIMARY KEY (user_id, ad_id, watched_at)
         );
+        CREATE TABLE IF NOT EXISTS ad_sessions (
+            user_id INTEGER, ad_id INTEGER, started_at INTEGER,
+            PRIMARY KEY (user_id, ad_id)
+        );
         CREATE TABLE IF NOT EXISTS withdrawals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER, amount REAL,
@@ -290,6 +295,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_users_earned ON users(total_earned DESC);
         CREATE INDEX IF NOT EXISTS idx_ads_active ON ads(active);
         CREATE INDEX IF NOT EXISTS idx_user_ads ON user_ads(user_id, ad_id);
+        CREATE INDEX IF NOT EXISTS idx_ad_sessions ON ad_sessions(user_id, ad_id);
         """)
 
         for tbl, col, typ in [
@@ -439,6 +445,14 @@ def validate_init_data(init_data):
         received = parsed.pop("hash", None)
         if not received:
             return None
+        auth_date_raw = parsed.get("auth_date")
+        if auth_date_raw:
+            try:
+                auth_age = int(time.time()) - int(auth_date_raw)
+                if auth_age < -300 or auth_age > MAX_INIT_DATA_AGE:
+                    return None
+            except (TypeError, ValueError):
+                return None
         check = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
         secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
         calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
@@ -453,12 +467,33 @@ def validate_init_data(init_data):
 async def get_init_data_from_request(req: Request) -> Optional[str]:
     hdr = req.headers.get("x-init-data")
     if hdr:
-        return hdr
+        return hdr.strip()
     try:
         body = await req.json()
-        return body.get("init_data") or body.get("initData")
+        return (body.get("init_data") or body.get("initData") or "").strip()
     except Exception:
         return None
+
+
+async def get_current_user_id(req: Request) -> int:
+    """استخراج هوية المستخدم من Telegram initData الموقّعة، وليس من بيانات العميل."""
+    init_data = await get_init_data_from_request(req)
+    if not init_data:
+        raise HTTPException(401, "initData مطلوب")
+    parsed = validate_init_data(init_data)
+    if not parsed or not parsed.get("user"):
+        raise HTTPException(401, "initData غير صالح")
+    try:
+        uid = int(parsed["user"].get("id", 0))
+    except (TypeError, ValueError):
+        uid = 0
+    if uid <= 0:
+        raise HTTPException(401, "هوية Telegram غير صالحة")
+    with db() as conn:
+        row = conn.execute("SELECT banned FROM users WHERE user_id=?", (uid,)).fetchone()
+    if row and row["banned"]:
+        raise HTTPException(403, "حسابك موقوف")
+    return uid
 
 
 async def verify_admin(req: Request, user_id_fallback: Optional[int] = None) -> int:
@@ -614,7 +649,8 @@ async def api_auth(req: Request):
 
 
 @app.get("/api/me")
-async def api_me(user_id: int):
+async def api_me(req: Request):
+    user_id = await get_current_user_id(req)
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     if not row:
@@ -625,7 +661,8 @@ async def api_me(user_id: int):
 
 
 @app.get("/api/rank")
-async def api_rank(user_id: int):
+async def api_rank(req: Request):
+    user_id = await get_current_user_id(req)
     rank, total = user_rank(user_id)
     return {"rank": rank, "total": total}
 
@@ -633,7 +670,7 @@ async def api_rank(user_id: int):
 @app.post("/api/set-lang")
 async def api_set_lang(req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    user_id = await get_current_user_id(req)
     lang_code = (body.get("lang") or "ar").strip()
     if lang_code not in LANGS:
         lang_code = "ar"
@@ -645,7 +682,8 @@ async def api_set_lang(req: Request):
 # 📢 الإعلانات
 # ═══════════════════════════════════════════════════════════════════════
 @app.get("/api/ads")
-async def api_ads(user_id: int):
+async def api_ads(req: Request):
+    user_id = await get_current_user_id(req)
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
         if not row:
@@ -664,6 +702,13 @@ async def api_ads(user_id: int):
                  )
                ORDER BY RANDOM() LIMIT 30""",
             (user_id,)).fetchall()
+
+        # بدء جلسة مشاهدة على الخادم؛ لا يكفي مؤقت JavaScript وحده لاستحقاق المكافأة.
+        started_at = int(time.time())
+        for ad in ads:
+            conn.execute(
+                "INSERT OR REPLACE INTO ad_sessions (user_id, ad_id, started_at) VALUES (?,?,?)",
+                (user_id, ad["id"], started_at))
 
         fresh = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
         total_active = conn.execute(
@@ -756,9 +801,10 @@ async def api_ad_media(ad_id: int, index: int):
 
 @app.post("/api/ads/{ad_id}/watch")
 async def api_watch_ad(ad_id: int, req: Request):
-    body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    await req.json()  # الحفاظ على توافق الواجهة الحالية
+    user_id = await get_current_user_id(req)
     with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
         if not row:
             raise HTTPException(404, "غير موجود")
@@ -771,11 +817,22 @@ async def api_watch_ad(ad_id: int, req: Request):
         if not ad:
             raise HTTPException(404, "الإعلان غير متاح")
         already = conn.execute(
-            "SELECT 1 FROM user_ads WHERE user_id=? AND ad_id=?",
+            "SELECT 1 FROM user_ads WHERE user_id=? AND ad_id=? LIMIT 1",
             (user_id, ad_id)).fetchone()
         if already:
             raise HTTPException(429, "شاهدت هذا الإعلان مسبقًا")
-        reward = ad["reward"] or float(get_setting("ad_reward", "0.20"))
+
+        session = conn.execute(
+            "SELECT started_at FROM ad_sessions WHERE user_id=? AND ad_id=?",
+            (user_id, ad_id)).fetchone()
+        if not session:
+            raise HTTPException(400, "ابدأ الإعلان من التطبيق أولاً")
+        elapsed = int(time.time()) - int(session["started_at"] or 0)
+        required = max(0, int(ad["duration"] or 0))
+        if elapsed < required:
+            raise HTTPException(400, f"انتظر {required - elapsed} ثانية قبل استلام المكافأة")
+
+        reward = float(ad["reward"] if ad["reward"] is not None else get_setting("ad_reward", "0.20"))
         conn.execute(
             "INSERT INTO user_ads (user_id, ad_id, watched_at) VALUES (?,?,?)",
             (user_id, ad_id, datetime.now(timezone.utc).isoformat()))
@@ -783,6 +840,7 @@ async def api_watch_ad(ad_id: int, req: Request):
             """UPDATE users SET balance=balance+?, total_earned=total_earned+?,
                ads_watched=ads_watched+1, ads_today=ads_today+1 WHERE user_id=?""",
             (reward, reward, user_id))
+        conn.execute("DELETE FROM ad_sessions WHERE user_id=? AND ad_id=?", (user_id, ad_id))
         conn.execute("UPDATE ads SET views=views+1 WHERE id=?", (ad_id,))
         new_row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     return {"reward": reward, "balance": round(new_row["balance"], 2),
@@ -792,7 +850,8 @@ async def api_watch_ad(ad_id: int, req: Request):
 # 📋 المهام
 # ═══════════════════════════════════════════════════════════════════════
 @app.get("/api/tasks")
-async def api_tasks(user_id: int):
+async def api_tasks(req: Request):
+    user_id = await get_current_user_id(req)
     with db() as conn:
         rows = conn.execute("SELECT * FROM tasks WHERE active=1 ORDER BY id DESC").fetchall()
         done = {r["task_id"] for r in conn.execute(
@@ -866,7 +925,7 @@ async def api_tasks(user_id: int):
 @app.post("/api/tasks/{task_id}/start")
 async def api_task_start(task_id: int, req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    user_id = await get_current_user_id(req)
     with db() as conn:
         task = conn.execute("SELECT * FROM tasks WHERE id=? AND active=1", (task_id,)).fetchone()
         if not task:
@@ -896,7 +955,7 @@ async def api_task_start(task_id: int, req: Request):
 @app.post("/api/tasks/{task_id}/confirm")
 async def api_task_confirm(task_id: int, req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    user_id = await get_current_user_id(req)
 
     with db() as conn:
         task = conn.execute("SELECT * FROM tasks WHERE id=? AND active=1", (task_id,)).fetchone()
@@ -935,7 +994,7 @@ async def api_task_confirm(task_id: int, req: Request):
 @app.post("/api/tasks/{task_id}/claim")
 async def api_task_claim(task_id: int, req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    user_id = await get_current_user_id(req)
     wait_seconds = int(get_setting("task_wait", "10"))
 
     with db() as conn:
@@ -968,9 +1027,11 @@ async def api_task_claim(task_id: int, req: Request):
         except Exception:
             pass
 
-        conn.execute(
-            "INSERT INTO user_tasks (user_id, task_id, completed_at) VALUES (?,?,?)",
+        cur_done = conn.execute(
+            "INSERT OR IGNORE INTO user_tasks (user_id, task_id, completed_at) VALUES (?,?,?)",
             (user_id, task_id, datetime.now(timezone.utc).isoformat()))
+        if cur_done.rowcount != 1:
+            raise HTTPException(400, "منجزة مسبقًا")
         if task["reward"] and task["reward"] > 0:
             conn.execute(
                 """UPDATE users SET balance=balance+?, total_earned=total_earned+?
@@ -983,22 +1044,25 @@ async def api_task_claim(task_id: int, req: Request):
 @app.post("/api/daily")
 async def api_daily(req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    user_id = await get_current_user_id(req)
     now = int(time.time()); day = 86400
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
         if not row:
             raise HTTPException(404, "غير موجود")
-        since = now - (row["last_daily"] or 0)
+        old_last_daily = int(row["last_daily"] or 0)
+        since = now - old_last_daily
         if since < day:
             raise HTTPException(400, f"عد بعد {(day - since)//3600} ساعة")
         streak = row["streak"] + 1 if since < 2 * day else 1
         base = float(get_setting("daily_bonus", "0.10"))
         reward = round(base * min(streak, 7), 2)
-        conn.execute(
+        cur_daily = conn.execute(
             """UPDATE users SET balance=balance+?, total_earned=total_earned+?,
-               streak=?, last_daily=? WHERE user_id=?""",
-            (reward, reward, streak, now, user_id))
+               streak=?, last_daily=? WHERE user_id=? AND last_daily=?""",
+            (reward, reward, streak, now, user_id, old_last_daily))
+        if cur_daily.rowcount != 1:
+            raise HTTPException(409, "تم استلام المكافأة اليومية بالفعل")
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     return {"reward": reward, "streak": streak, "balance": round(row["balance"], 2)}
 
@@ -1023,7 +1087,7 @@ async def api_countries():
 @app.post("/api/withdrawal/setup")
 async def api_setup_withdrawal(req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    user_id = await get_current_user_id(req)
     country = (body.get("country") or "").strip()
     method_id = (body.get("method") or "").strip()
     fields_in = body.get("fields") or {}
@@ -1051,9 +1115,14 @@ async def api_setup_withdrawal(req: Request):
 @app.post("/api/withdraw")
 async def api_withdraw(req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
-    amount = float(body.get("amount", 0))
+    user_id = await get_current_user_id(req)
+    try:
+        amount = float(body.get("amount", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "المبلغ غير صالح")
     min_w = float(get_setting("min_withdraw", "10.00"))
+    if not math.isfinite(amount) or amount <= 0:
+        raise HTTPException(400, "المبلغ غير صالح")
     if amount < min_w:
         raise HTTPException(400, f"الحد الأدنى ${min_w:.2f}")
     with db() as conn:
@@ -1066,7 +1135,11 @@ async def api_withdraw(req: Request):
             raise HTTPException(400, "رصيدك غير كافٍ")
         method = get_method(row["country"], row["withdrawal_method"])
         method_name = method["name"] if method else row["withdrawal_method"]
-        conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, user_id))
+        cur_debit = conn.execute(
+            "UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",
+            (amount, user_id, amount))
+        if cur_debit.rowcount != 1:
+            raise HTTPException(400, "رصيدك غير كافٍ")
         cur = conn.execute(
             """INSERT INTO withdrawals (user_id, amount, country, method,
                method_name, account_json, created_at)
@@ -1089,7 +1162,8 @@ async def api_withdraw(req: Request):
 
 
 @app.get("/api/withdrawals")
-async def api_withdrawals(user_id: int):
+async def api_withdrawals(req: Request):
+    user_id = await get_current_user_id(req)
     with db() as conn:
         rows = conn.execute(
             """SELECT id, amount, method_name, status, created_at
@@ -1101,7 +1175,7 @@ async def api_withdrawals(user_id: int):
 @app.post("/api/contact-request")
 async def api_contact_request(req: Request):
     body = await req.json()
-    user_id = int(body.get("user_id", 0))
+    user_id = await get_current_user_id(req)
     message = (body.get("message") or "").strip()
     if not message:
         raise HTTPException(400, "الرسالة مطلوبة")
@@ -1383,7 +1457,9 @@ async def adm_wd_approve(wid: int, req: Request):
         row = conn.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
         if not row:
             raise HTTPException(404, "غير موجود")
-        conn.execute("UPDATE withdrawals SET status='approved', processed_at=? WHERE id=?",
+        if row["status"] != "pending":
+            raise HTTPException(409, "تمت معالجة الطلب مسبقًا")
+        conn.execute("UPDATE withdrawals SET status='approved', processed_at=? WHERE id=? AND status='pending'",
                      (datetime.now(timezone.utc).isoformat(), wid))
     try:
         async with httpx.AsyncClient() as c:
@@ -1774,9 +1850,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wid = int(d.split("_")[-1])
         with db() as conn:
             row = conn.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
-            conn.execute(
-                "UPDATE withdrawals SET status='approved', processed_at=? WHERE id=?",
-                (datetime.now(timezone.utc).isoformat(), wid))
+            if row and row["status"] == "pending":
+                conn.execute(
+                    "UPDATE withdrawals SET status='approved', processed_at=? WHERE id=? AND status='pending'",
+                    (datetime.now(timezone.utc).isoformat(), wid))
+            elif row:
+                await q.answer("تمت معالجة الطلب مسبقًا", show_alert=True)
+                return
         if row:
             try:
                 await context.bot.send_message(
